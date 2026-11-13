@@ -64,9 +64,16 @@ public final class ChronoMonitor: ObservableObject {
     }
 
     public var menuBarLabel: String {
-        guard let latest = ticks.last else { return "DVR Ready" }
+        menuBarLabel(in: AppLocalizer.shared.language)
+    }
+
+    public func menuBarLabel(in language: AppLanguage) -> String {
+        guard let latest = ticks.last else {
+            return language == .zhHans ? "DVR 就绪" : "DVR Ready"
+        }
         if latest.swapUsedBytes >= 1_073_741_824 {
-            return String(format: "%.0f%% · Swap %@", latest.totalCPUPct, ChronoFormatter.bytes(latest.swapUsedBytes))
+            let prefix = language == .zhHans ? "交换" : "Swap"
+            return String(format: "%.0f%% · %@ %@", latest.totalCPUPct, prefix, ChronoFormatter.bytes(latest.swapUsedBytes))
         }
         return String(format: "%.0f%% · ↑%@", latest.totalCPUPct, ChronoFormatter.rate(latest.netOutBps))
     }
@@ -102,11 +109,18 @@ public final class ChronoMonitor: ObservableObject {
 
     public func terminateProcess(_ proc: ProcessSample) {
         guard proc.isAliveNow, proc.pid > 1 else { return }
+        let loc = AppLocalizer.shared
         if kill(pid_t(proc.pid), SIGTERM) == 0 {
-            statusBanner = "Sent SIGTERM to \(proc.name) (PID \(proc.pid))."
+            statusBanner = loc.L(
+                "Sent SIGTERM to \(proc.name) (PID \(proc.pid)).",
+                "已向 \(proc.name) (PID \(proc.pid)) 发送 SIGTERM。"
+            )
             captureLiveTick()
         } else {
-            statusBanner = "Could not signal PID \(proc.pid) — check process ownership."
+            statusBanner = loc.L(
+                "Could not signal PID \(proc.pid) — check process ownership.",
+                "无法向 PID \(proc.pid) 发送信号，请检查进程所有权。"
+            )
         }
     }
 
@@ -460,18 +474,25 @@ public final class ChronoMonitor: ObservableObject {
 
 public enum ChronoScreenshotExporter {
     @MainActor
-    public static func exportMarketingScreenshots(to directory: URL) throws {
+    public static func exportMarketingScreenshots(to directory: URL, language: AppLanguage = .en) throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let monitor = ChronoMonitor.preview()
+        let localizer = AppLocalizer(language: language)
         let fixedTZ = TimeZone(secondsFromGMT: 0)!
+        let suffix = language == .zhHans ? "-zh" : ""
 
-        let mainView = ChronoDashboardView(monitor: monitor, displayTimeZone: fixedTZ)
-            .frame(width: 1124, height: 736)
-            .environment(\.colorScheme, .light)
-        try renderPNG(view: mainView, to: directory.appendingPathComponent("screenshot-main.png"))
+        let mainView = ChronoDashboardView(
+            monitor: monitor,
+            localizer: localizer,
+            displayTimeZone: fixedTZ
+        )
+        .frame(width: 1124, height: 736)
+        .environment(\.colorScheme, .light)
+        try renderPNG(view: mainView, to: directory.appendingPathComponent("screenshot-main\(suffix).png"))
 
         let menuView = ChronoMenuBarView(
             monitor: monitor,
+            localizer: localizer,
             displayTimeZone: fixedTZ,
             onOpenDashboard: {},
             onQuit: {}
@@ -480,7 +501,7 @@ public enum ChronoScreenshotExporter {
         .padding(14)
         .background(Color(red: 0.898, green: 0.890, blue: 0.863))
         .environment(\.colorScheme, .light)
-        try renderPNG(view: menuView, to: directory.appendingPathComponent("screenshot-menubar.png"))
+        try renderPNG(view: menuView, to: directory.appendingPathComponent("screenshot-menubar\(suffix).png"))
     }
 
     @MainActor

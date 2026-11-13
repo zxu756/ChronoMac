@@ -6,6 +6,7 @@ import SwiftUI
 @main
 struct ChronoMacApp: App {
     @StateObject private var monitor: ChronoMonitor
+    @StateObject private var localizer: AppLocalizer
     @Environment(\.openWindow) private var openWindow
 
     init() {
@@ -13,11 +14,12 @@ struct ChronoMacApp: App {
 
         if let idx = args.firstIndex(of: "--export-screenshots"), idx + 1 < args.count {
             let outURL = URL(fileURLWithPath: args[idx + 1])
+            let exportLang = AppLanguage.parseCLIArguments(args) ?? .en
             do {
                 try MainActor.assumeIsolated {
-                    try ChronoScreenshotExporter.exportMarketingScreenshots(to: outURL)
+                    try ChronoScreenshotExporter.exportMarketingScreenshots(to: outURL, language: exportLang)
                 }
-                print("Exported 2x Retina screenshots to \(outURL.path)")
+                print("Exported 2x Retina screenshots (\(exportLang.rawValue)) to \(outURL.path)")
                 exit(0)
             } catch {
                 fputs("Failed to export screenshots: \(error.localizedDescription)\n", stderr)
@@ -42,18 +44,43 @@ struct ChronoMacApp: App {
             exit(0)
         }
 
+        _localizer = StateObject(wrappedValue: AppLocalizer.shared)
         _monitor = StateObject(wrappedValue: ChronoMonitor())
     }
 
     var body: some Scene {
         Window("ChronoMac", id: "main") {
-            ChronoDashboardView(monitor: monitor)
+            ChronoDashboardView(monitor: monitor, localizer: localizer)
         }
         .defaultSize(width: 1124, height: 736)
+        .commands {
+            CommandMenu(localizer.L("Language", "语言")) {
+                Button(localizer.L("Toggle Language (中文 / EN)", "切换语言 / Toggle Language")) {
+                    localizer.toggle()
+                }
+                .keyboardShortcut("l", modifiers: [.command, .shift])
+
+                Divider()
+
+                ForEach(AppLanguage.allCases) { item in
+                    Button {
+                        localizer.setLanguage(item)
+                    } label: {
+                        HStack {
+                            Text("\(item.displayName) (\(item.badge))")
+                            if localizer.language == item {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         MenuBarExtra {
             ChronoMenuBarView(
                 monitor: monitor,
+                localizer: localizer,
                 onOpenDashboard: {
                     NSApp.activate(ignoringOtherApps: true)
                     openWindow(id: "main")
@@ -66,7 +93,7 @@ struct ChronoMacApp: App {
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: "waveform.path.ecg")
-                Text(monitor.menuBarLabel)
+                Text(monitor.menuBarLabel(in: localizer.language))
                     .monospacedDigit()
             }
         }

@@ -201,16 +201,90 @@ struct ChronoMacCoreTests {
         #expect(callResp.contains("claude"))
     }
 
-    @Test("Exports 2x Retina marketing PNG screenshots cleanly")
+    @Test("Exports 2x Retina marketing PNG screenshots cleanly in EN and zh-Hans")
     @MainActor
     func exportMarketingScreenshots() throws {
         let outDir = FileManager.default.temporaryDirectory.appendingPathComponent("chronomac-shots-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: outDir) }
-        try ChronoScreenshotExporter.exportMarketingScreenshots(to: outDir)
+        try ChronoScreenshotExporter.exportMarketingScreenshots(to: outDir, language: .en)
+        try ChronoScreenshotExporter.exportMarketingScreenshots(to: outDir, language: .zhHans)
 
         let mainData = try Data(contentsOf: outDir.appendingPathComponent("screenshot-main.png"))
         let menuData = try Data(contentsOf: outDir.appendingPathComponent("screenshot-menubar.png"))
+        let mainZhData = try Data(contentsOf: outDir.appendingPathComponent("screenshot-main-zh.png"))
+        let menuZhData = try Data(contentsOf: outDir.appendingPathComponent("screenshot-menubar-zh.png"))
         #expect(mainData.count > 40_000)
         #expect(menuData.count > 15_000)
+        #expect(mainZhData.count > 40_000)
+        #expect(menuZhData.count > 15_000)
+    }
+
+    @Test("AppLocalizer resolves --lang CLI, UserDefaults, and Chinese system locale with live toggle")
+    @MainActor
+    func localizationResolutionAndToggle() throws {
+        let suiteName = "io.github.zxu756.ChronoMac.tests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let key = "io.github.zxu756.ChronoMac.language"
+
+        // 1. Auto-detects Chinese from Locale.preferredLanguages when UserDefaults & CLI are unset
+        let zhAuto = AppLocalizer(
+            arguments: ["ChronoMac"],
+            userDefaults: defaults,
+            preferredLanguages: ["zh-Hans-CN", "en-US"],
+            defaultsKey: key
+        )
+        #expect(zhAuto.language == .zhHans)
+        #expect(zhAuto.language.badge == "中文")
+        #expect(zhAuto.L("Live", "实时") == "实时")
+
+        // 2. Falls back to English on non-Chinese system locale
+        let enAuto = AppLocalizer(
+            arguments: ["ChronoMac"],
+            userDefaults: defaults,
+            preferredLanguages: ["en-US"],
+            defaultsKey: key
+        )
+        #expect(enAuto.language == .en)
+        #expect(enAuto.language.badge == "EN")
+        #expect(enAuto.L("Live", "实时") == "Live")
+
+        // 3. Toggle persists to UserDefaults and flips zh-Hans <-> en
+        enAuto.toggle()
+        #expect(enAuto.language == .zhHans)
+        #expect(defaults.string(forKey: key) == "zh-Hans")
+
+        enAuto.toggle()
+        #expect(enAuto.language == .en)
+        #expect(defaults.string(forKey: key) == "en")
+
+        // 4. UserDefaults overrides system locale
+        defaults.set("zh-Hans", forKey: key)
+        let fromDefaults = AppLocalizer(
+            arguments: ["ChronoMac"],
+            userDefaults: defaults,
+            preferredLanguages: ["en-US"],
+            defaultsKey: key
+        )
+        #expect(fromDefaults.language == .zhHans)
+
+        // 5. CLI --lang flag overrides both UserDefaults and system locale
+        let cliOverrideEN = AppLocalizer(
+            arguments: ["ChronoMac", "--lang", "en"],
+            userDefaults: defaults,
+            preferredLanguages: ["zh-Hans-CN"],
+            defaultsKey: key
+        )
+        #expect(cliOverrideEN.language == .en)
+
+        let cliOverrideZH = AppLocalizer(
+            arguments: ["ChronoMac", "--export-screenshots", "/tmp", "--lang=zh"],
+            userDefaults: defaults,
+            preferredLanguages: ["en-US"],
+            defaultsKey: key
+        )
+        #expect(cliOverrideZH.language == .zhHans)
+        #expect(ThermalGrade.serious.label(in: .zhHans) == "降频限温")
+        #expect(AnomalyKind.swapSurge.label(in: .zhHans) == "交换激增")
     }
 }

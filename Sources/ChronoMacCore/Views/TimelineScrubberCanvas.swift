@@ -23,6 +23,7 @@ enum ChronoTheme {
 }
 
 public struct TimelineScrubberCanvas: View {
+    @ObservedObject var localizer: AppLocalizer
     public let ticks: [SystemTick]
     public let anomalies: [AnomalyBookmark]
     public let agentWindows: [AgentBurstWindow]
@@ -31,9 +32,10 @@ public struct TimelineScrubberCanvas: View {
     public let timeZone: TimeZone
     public var onScrub: (Int64?) -> Void
 
-    private let leftGutterWidth: CGFloat = 142
+    private let leftGutterWidth: CGFloat = 148
     private let rightPadding: CGFloat = 14
 
+    @MainActor
     public init(
         ticks: [SystemTick],
         anomalies: [AnomalyBookmark],
@@ -41,8 +43,10 @@ public struct TimelineScrubberCanvas: View {
         scrubbedTimestamp: Int64?,
         spanSeconds: Int64,
         timeZone: TimeZone = .current,
+        localizer: AppLocalizer = .shared,
         onScrub: @escaping (Int64?) -> Void
     ) {
+        self.localizer = localizer
         self.ticks = ticks
         self.anomalies = anomalies
         self.agentWindows = agentWindows
@@ -67,11 +71,36 @@ public struct TimelineScrubberCanvas: View {
 
                 // Track Labels on Left Gutter
                 VStack(alignment: .leading, spacing: 0) {
-                    trackLabelCell(title: "CPU & thermal", subtitle: "0–100% SoC", color: ChronoTheme.cpuAmber, height: 40)
-                    trackLabelCell(title: "Memory & swap", subtitle: "RAM + VM swap", color: ChronoTheme.memCobalt, height: 40)
-                    trackLabelCell(title: "Disk I/O", subtitle: "Read + write/s", color: ChronoTheme.diskPine, height: 36)
-                    trackLabelCell(title: "Network out/in", subtitle: "Socket throughput", color: ChronoTheme.netPlum, height: 36)
-                    trackLabelCell(title: "AI agent bursts", subtitle: "CLI session spans", color: ChronoTheme.playheadRed, height: 28)
+                    trackLabelCell(
+                        title: localizer.L("CPU & thermal", "CPU 与温控"),
+                        subtitle: localizer.L("0–100% SoC", "0–100% 芯片负载"),
+                        color: ChronoTheme.cpuAmber,
+                        height: 40
+                    )
+                    trackLabelCell(
+                        title: localizer.L("Memory & swap", "内存与交换"),
+                        subtitle: localizer.L("RAM + VM swap", "物理内存 + 交换区"),
+                        color: ChronoTheme.memCobalt,
+                        height: 40
+                    )
+                    trackLabelCell(
+                        title: localizer.L("Disk I/O", "磁盘读写 I/O"),
+                        subtitle: localizer.L("Read + write/s", "每秒读写吞吐"),
+                        color: ChronoTheme.diskPine,
+                        height: 36
+                    )
+                    trackLabelCell(
+                        title: localizer.L("Network out/in", "网络上下行"),
+                        subtitle: localizer.L("Socket throughput", "套接字吞吐速率"),
+                        color: ChronoTheme.netPlum,
+                        height: 36
+                    )
+                    trackLabelCell(
+                        title: localizer.L("AI agent bursts", "AI 代理活跃窗"),
+                        subtitle: localizer.L("CLI session spans", "CLI 会话活跃时段"),
+                        color: ChronoTheme.playheadRed,
+                        height: 28
+                    )
                     Spacer(minLength: 0)
                 }
                 .padding(.top, 8)
@@ -83,7 +112,7 @@ public struct TimelineScrubberCanvas: View {
                     ForEach(0..<5, id: \.self) { i in
                         let frac = Double(i) / 4.0
                         let ts = minTs + Int64(Double(maxTs - minTs) * frac)
-                        Text(ChronoFormatter.shortAxisTime(ts, spanSeconds: spanSeconds, timeZone: timeZone))
+                        Text(ChronoFormatter.shortAxisTime(ts, spanSeconds: spanSeconds, timeZone: timeZone, language: localizer.language))
                             .font(.system(size: 10.5, design: .monospaced))
                             .foregroundStyle(ChronoTheme.subtle)
                         if i < 4 { Spacer() }

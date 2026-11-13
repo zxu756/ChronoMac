@@ -14,11 +14,19 @@ public enum ThermalGrade: Int, Codable, CaseIterable, Sendable {
     case critical = 3
 
     public var label: String {
-        switch self {
-        case .nominal: return "Nominal"
-        case .fair: return "Elevated"
-        case .serious: return "Throttling"
-        case .critical: return "Critical"
+        label(in: .en)
+    }
+
+    public func label(in language: AppLanguage) -> String {
+        switch (self, language) {
+        case (.nominal, .en): return "Nominal"
+        case (.nominal, .zhHans): return "正常"
+        case (.fair, .en): return "Elevated"
+        case (.fair, .zhHans): return "偏高"
+        case (.serious, .en): return "Throttling"
+        case (.serious, .zhHans): return "降频限温"
+        case (.critical, .en): return "Critical"
+        case (.critical, .zhHans): return "严重过热"
         }
     }
 }
@@ -41,11 +49,29 @@ public enum TimeRangeWindow: String, CaseIterable, Identifiable, Sendable {
     }
 
     public var title: String {
-        switch self {
-        case .oneHour: return "Last 1 hour"
-        case .sixHours: return "Last 6 hours"
-        case .twentyFourHours: return "Last 24 hours"
-        case .sevenDays: return "Last 7 days"
+        title(in: .en)
+    }
+
+    public func shortLabel(in language: AppLanguage) -> String {
+        switch (self, language) {
+        case (_, .en): return rawValue
+        case (.oneHour, .zhHans): return "1小时"
+        case (.sixHours, .zhHans): return "6小时"
+        case (.twentyFourHours, .zhHans): return "24小时"
+        case (.sevenDays, .zhHans): return "7天"
+        }
+    }
+
+    public func title(in language: AppLanguage) -> String {
+        switch (self, language) {
+        case (.oneHour, .en): return "Last 1 hour"
+        case (.oneHour, .zhHans): return "最近 1 小时"
+        case (.sixHours, .en): return "Last 6 hours"
+        case (.sixHours, .zhHans): return "最近 6 小时"
+        case (.twentyFourHours, .en): return "Last 24 hours"
+        case (.twentyFourHours, .zhHans): return "最近 24 小时"
+        case (.sevenDays, .en): return "Last 7 days"
+        case (.sevenDays, .zhHans): return "最近 7 天"
         }
     }
 }
@@ -201,6 +227,17 @@ public enum AnomalyKind: String, Codable, CaseIterable, Sendable {
     case runawayCPU = "Sustained CPU"
     case thermalThrottle = "Thermal pressure"
     case newExternalHost = "New remote host"
+
+    public func label(in language: AppLanguage) -> String {
+        switch (self, language) {
+        case (_, .en): return rawValue
+        case (.swapSurge, .zhHans): return "交换激增"
+        case (.egressBurst, .zhHans): return "外联突增"
+        case (.runawayCPU, .zhHans): return "CPU 满载"
+        case (.thermalThrottle, .zhHans): return "热压降频"
+        case (.newExternalHost, .zhHans): return "新远程主机"
+        }
+    }
 }
 
 public struct AnomalyBookmark: Identifiable, Codable, Equatable, Sendable {
@@ -231,6 +268,21 @@ public struct AnomalyBookmark: Identifiable, Codable, Equatable, Sendable {
         self.culpritExec = culpritExec
         self.metricBadge = metricBadge
         self.summary = summary
+    }
+
+    public func localizedMetricBadge(in language: AppLanguage) -> String {
+        guard language == .zhHans else { return metricBadge }
+        if metricBadge.hasSuffix(" swap") {
+            return String(metricBadge.dropLast(" swap".count)) + " 交换"
+        }
+        if metricBadge.hasSuffix(" up") {
+            return "↑ " + String(metricBadge.dropLast(" up".count))
+        }
+        if metricBadge == "Nominal" { return "正常" }
+        if metricBadge == "Elevated" { return "偏高" }
+        if metricBadge == "Throttling" { return "降频限温" }
+        if metricBadge == "Critical" { return "严重过热" }
+        return metricBadge
     }
 }
 
@@ -285,10 +337,21 @@ public enum ChronoFormatter {
         return df.string(from: Date(timeIntervalSince1970: TimeInterval(ts)))
     }
 
-    public static func shortAxisTime(_ ts: Int64, spanSeconds: Int64, timeZone: TimeZone = .current) -> String {
+    public static func shortAxisTime(
+        _ ts: Int64,
+        spanSeconds: Int64,
+        timeZone: TimeZone = .current,
+        language: AppLanguage = .en
+    ) -> String {
         let df = DateFormatter()
         df.timeZone = timeZone
-        df.dateFormat = spanSeconds > 86_400 ? "d MMM HH:mm" : "HH:mm"
+        if spanSeconds > 86_400 {
+            df.locale = Locale(identifier: language == .zhHans ? "zh_Hans_CN" : "en_US_POSIX")
+            df.dateFormat = language == .zhHans ? "M/d HH:mm" : "d MMM HH:mm"
+        } else {
+            df.locale = Locale(identifier: "en_US_POSIX")
+            df.dateFormat = "HH:mm"
+        }
         return df.string(from: Date(timeIntervalSince1970: TimeInterval(ts)))
     }
 

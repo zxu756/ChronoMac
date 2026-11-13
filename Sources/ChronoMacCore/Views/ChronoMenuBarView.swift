@@ -2,17 +2,21 @@ import SwiftUI
 
 public struct ChronoMenuBarView: View {
     @ObservedObject var monitor: ChronoMonitor
+    @ObservedObject var localizer: AppLocalizer
     public let displayTimeZone: TimeZone
     public var onOpenDashboard: () -> Void
     public var onQuit: () -> Void
 
+    @MainActor
     public init(
         monitor: ChronoMonitor,
+        localizer: AppLocalizer = .shared,
         displayTimeZone: TimeZone = .current,
         onOpenDashboard: @escaping () -> Void,
         onQuit: @escaping () -> Void
     ) {
         self.monitor = monitor
+        self.localizer = localizer
         self.displayTimeZone = displayTimeZone
         self.onOpenDashboard = onOpenDashboard
         self.onQuit = onQuit
@@ -20,35 +24,52 @@ public struct ChronoMenuBarView: View {
 
     public var body: some View {
         let t = monitor.ticks.last
+        let rangeText = monitor.selectedRange.shortLabel(in: localizer.language)
+        let swapBytes = ChronoFormatter.bytes(t?.swapUsedBytes ?? 0)
 
         VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .top) {
+            HStack(alignment: .center, spacing: 8) {
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 6) {
                         Image(systemName: "waveform.path.ecg")
                             .font(.system(size: 11.5, weight: .bold))
                             .foregroundStyle(ChronoTheme.cpuAmber)
-                        Text("ChronoMac Flightbox")
+                        Text(localizer.L("ChronoMac Flightbox", "ChronoMac 飞行匣"))
                             .font(.system(size: 13.5, weight: .bold))
-                            .tracking(-0.2)
+                            .tracking(localizer.isChinese ? 0 : -0.2)
                             .foregroundStyle(ChronoTheme.ink)
+                            .fixedSize(horizontal: true, vertical: false)
                     }
-                    Text("\(monitor.anomalies.count) incident bookmarks in \(monitor.selectedRange.rawValue)")
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(ChronoTheme.muted)
+                    Text(
+                        localizer.L(
+                            "\(monitor.anomalies.count) incident bookmarks in \(rangeText)",
+                            "近 \(rangeText) 内 \(monitor.anomalies.count) 条异常书签"
+                        )
+                    )
+                    .font(.system(size: 11, design: .monospaced))
+                    .tracking(0)
+                    .foregroundStyle(ChronoTheme.muted)
+                    .fixedSize(horizontal: true, vertical: false)
                 }
-                Spacer()
+
+                Spacer(minLength: 4)
+
+                ChronoLanguageTogglePill(localizer: localizer, compact: true)
+
                 VStack(alignment: .trailing, spacing: 1) {
                     Text(String(format: "%.0f%% CPU", t?.totalCPUPct ?? 0))
-                        .font(.system(size: 16, weight: .bold, design: .monospaced))
+                        .font(.system(size: 15, weight: .bold, design: .monospaced))
                         .foregroundStyle(ChronoTheme.ink)
-                    Text("Swap \(ChronoFormatter.bytes(t?.swapUsedBytes ?? 0))")
+                        .fixedSize(horizontal: true, vertical: false)
+                    Text(localizer.L("Swap \(swapBytes)", "交换 \(swapBytes)"))
                         .font(.system(size: 10.5, design: .monospaced))
+                        .tracking(0)
                         .foregroundStyle(ChronoTheme.memCobalt)
+                        .fixedSize(horizontal: true, vertical: false)
                 }
             }
-            .padding(.horizontal, 15)
-            .padding(.vertical, 12)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 11)
             .background(ChronoTheme.chassis)
 
             Rectangle().fill(ChronoTheme.hairline).frame(height: 1)
@@ -84,8 +105,9 @@ public struct ChronoMenuBarView: View {
 
             // Recent Incident Bookmarks
             VStack(alignment: .leading, spacing: 0) {
-                Text("Recent forensic bookmarks")
+                Text(localizer.L("Recent forensic bookmarks", "最近取证异常书签"))
                     .font(.system(size: 10.5, weight: .semibold))
+                    .tracking(0)
                     .foregroundStyle(ChronoTheme.muted)
                     .padding(.horizontal, 15)
                     .padding(.vertical, 6.5)
@@ -94,37 +116,50 @@ public struct ChronoMenuBarView: View {
 
                 Rectangle().fill(ChronoTheme.rowRule).frame(height: 1)
 
-                ForEach(monitor.anomalies.prefix(3)) { bm in
-                    Button(action: {
-                        monitor.jumpToAnomaly(bm)
-                        onOpenDashboard()
-                    }) {
-                        HStack(alignment: .top, spacing: 8) {
-                            RoundedRectangle(cornerRadius: 1.5)
-                                .fill(ChronoTheme.playheadRed)
-                                .frame(width: 3, height: 28)
-                            VStack(alignment: .leading, spacing: 2) {
-                                HStack {
-                                    Text("\(ChronoFormatter.clockTime(bm.ts, timeZone: displayTimeZone)) · \(bm.kind.rawValue)")
-                                        .font(.system(size: 11.5, weight: .semibold))
-                                        .foregroundStyle(ChronoTheme.ink)
-                                    Spacer()
-                                    Text(verbatim: bm.metricBadge)
-                                        .font(.system(size: 10.5, weight: .bold, design: .monospaced))
-                                        .foregroundStyle(ChronoTheme.playheadRed)
-                                }
-                                Text(bm.culpritName)
-                                    .font(.system(size: 10.5, design: .monospaced))
-                                    .foregroundStyle(ChronoTheme.muted)
-                                    .lineLimit(1)
-                            }
-                        }
+                if monitor.anomalies.isEmpty {
+                    Text(localizer.L("No anomalies recorded in current window", "当前窗口内暂无异常书签"))
+                        .font(.system(size: 11.5))
+                        .tracking(0)
+                        .foregroundStyle(ChronoTheme.muted)
                         .padding(.horizontal, 15)
-                        .padding(.vertical, 8.5)
-                        .background(ChronoTheme.viewport)
+                        .padding(.vertical, 18)
+                } else {
+                    ForEach(monitor.anomalies.prefix(3)) { bm in
+                        Button(action: {
+                            monitor.jumpToAnomaly(bm)
+                            onOpenDashboard()
+                        }) {
+                            HStack(alignment: .top, spacing: 8) {
+                                RoundedRectangle(cornerRadius: 1.5)
+                                    .fill(ChronoTheme.playheadRed)
+                                    .frame(width: 3, height: 28)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    HStack {
+                                        Text("\(ChronoFormatter.clockTime(bm.ts, timeZone: displayTimeZone)) · \(bm.kind.label(in: localizer.language))")
+                                            .font(.system(size: 11.5, weight: .semibold))
+                                            .tracking(0)
+                                            .foregroundStyle(ChronoTheme.ink)
+                                            .fixedSize(horizontal: true, vertical: false)
+                                        Spacer()
+                                        Text(verbatim: bm.localizedMetricBadge(in: localizer.language))
+                                            .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                                            .tracking(0)
+                                            .foregroundStyle(ChronoTheme.playheadRed)
+                                            .fixedSize(horizontal: true, vertical: false)
+                                    }
+                                    Text(bm.culpritName)
+                                        .font(.system(size: 10.5, design: .monospaced))
+                                        .foregroundStyle(ChronoTheme.muted)
+                                        .lineLimit(1)
+                                }
+                            }
+                            .padding(.horizontal, 15)
+                            .padding(.vertical, 8.5)
+                            .background(ChronoTheme.viewport)
+                        }
+                        .buttonStyle(.plain)
+                        Rectangle().fill(ChronoTheme.rowRule).frame(height: 1)
                     }
-                    .buttonStyle(.plain)
-                    Rectangle().fill(ChronoTheme.rowRule).frame(height: 1)
                 }
             }
 
@@ -132,21 +167,25 @@ public struct ChronoMenuBarView: View {
 
             HStack(spacing: 8) {
                 Button(action: onOpenDashboard) {
-                    Text("Open DVR timeline")
+                    Text(localizer.L("Open DVR timeline", "打开 DVR 时间轴"))
                         .font(.system(size: 12, weight: .semibold))
+                        .tracking(0)
                         .foregroundStyle(.white)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 5.5)
+                        .fixedSize(horizontal: true, vertical: false)
                         .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(ChronoTheme.ink))
                 }
                 .buttonStyle(.plain)
 
                 Button(action: { monitor.returnToLive() }) {
-                    Text("Live now")
+                    Text(localizer.L("Live now", "回到实时"))
                         .font(.system(size: 12, weight: .medium))
+                        .tracking(0)
                         .foregroundStyle(ChronoTheme.ink)
-                        .padding(.horizontal, 10)
+                        .padding(.horizontal, 11)
                         .padding(.vertical, 5.5)
+                        .fixedSize(horizontal: true, vertical: false)
                         .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(ChronoTheme.viewport))
                         .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).strokeBorder(ChronoTheme.hairline, lineWidth: 1))
                 }
@@ -155,11 +194,13 @@ public struct ChronoMenuBarView: View {
                 Spacer()
 
                 Button(action: onQuit) {
-                    Text("Quit")
+                    Text(localizer.L("Quit", "退出"))
                         .font(.system(size: 12))
+                        .tracking(0)
                         .foregroundStyle(ChronoTheme.muted)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 5)
+                        .fixedSize(horizontal: true, vertical: false)
                 }
                 .buttonStyle(.plain)
             }
