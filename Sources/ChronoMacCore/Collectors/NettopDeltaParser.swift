@@ -60,17 +60,41 @@ public struct NettopSnapshotResult: Sendable, Equatable {
 }
 
 public final class NettopDeltaParser: @unchecked Sendable {
-    private struct CounterPair: Equatable {
+    private struct RetainedCounter: Equatable {
+        var bytesIn: Int64
+        var bytesOut: Int64
+        var lastSeenTick: Int
+    }
+
+    private struct ParsedSocketRow {
+        var pid: Int
+        var processName: String
+        var token: String
+        var interfaceName: String?
         var bytesIn: Int64
         var bytesOut: Int64
     }
 
-    private var prevProcessCounters: [String: CounterPair] = [:]
-    private var prevSocketCounters: [String: CounterPair] = [:]
+    public let maxAbsentTicks: Int
+    private var prevSocketCounters: [String: RetainedCounter] = [:]
+    private var hasEstablishedBaseline = false
+    private var tickSequence: Int = 0
     private var lastSampleTime: TimeInterval?
     private let lock = NSLock()
 
-    public init() {}
+    public convenience init() {
+        self.init(maxAbsentTicks: 60)
+    }
+
+    public init(maxAbsentTicks: Int) {
+        self.maxAbsentTicks = max(0, maxAbsentTicks)
+    }
+
+    public var trackedSocketCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return prevSocketCounters.count
+    }
 
     public func sampleLiveHost(now: TimeInterval = Date().timeIntervalSince1970) -> NettopSnapshotResult {
         let proc = Process()
@@ -92,33 +116,21 @@ public final class NettopDeltaParser: @unchecked Sendable {
         }
     }
 
-    /// Ingests `nettop -L 1 -n -J interface,state,bytes_in,bytes_out` (or legacy/collapsed CSV) output,
+    /// Ingests `nettop -L 1 -n -J interface,state,bytes_in,bytes_out` per-socket CSV output,
     /// separating `lo0` / `127.0.0.0/8` / `::1` loopback traffic into dedicated loopback counters so loopback never inflates external rates.
-    /// Tick 1 establishes the global baseline of pre-existing open sockets; on subsequent ticks, newly appearing processes/sockets
-    /// carry post-baseline bytes (`nettop` enumerates live kernel sockets via `NStatManager`) and are attributed on first sight.
+    /// Global baseline is only established once a snapshot contains at least 1 parsed data row; per-socket counters are retained across up to
+    /// `maxAbsentTicks` polls so transiently absent connections do not replay cumulative totals, and evicted beyond `maxAbsentTicks` so state stays bounded.
     public func ingestCSV(_ csv: String, now: TimeInterval) -> NettopSnapshotResult {
         lock.lock()
         defer { lock.unlock() }
-
-        let dt = max(0.5, lastSampleTime.map { now - $0 } ?? 1.0)
-        let isFirstBaseline = (lastSampleTime == nil)
-        lastSampleTime = now
 
         var interfaceColIdx: Int? = nil
         var bytesInColIdx = 2
         var bytesOutColIdx = 3
         var headerParsed = false
 
-        var curProcCounters: [String: CounterPair] = [:]
-        var curProcPIDs: [String: Int] = [:]
-        var curSockCounters: [String: CounterPair] = [:]
-        var perPIDExtInBytes: [Int: Int64] = [:]
-        var perPIDExtOutBytes: [Int: Int64] = [:]
-        var perPIDLoopInBytes: [Int: Int64] = [:]
-        var perPIDLoopOutBytes: [Int: Int64] = [:]
-        var sockDeltas: [NettopSocketDelta] = []
-        var sawAnySocketRow = false
-
+        var sawAnyProcessRow = false
+        var socketRows: [ParsedSocketRow] = []
         var currentPID: Int?
         var currentProcName: String = ""
 
@@ -146,72 +158,109 @@ public final class NettopDeltaParser: @unchecked Sendable {
 
             // Socket row starts with tcp* / udp* / quic* and contains "<->"
             if (first.hasPrefix("tcp") || first.hasPrefix("udp") || first.hasPrefix("quic")), first.contains("<->") {
-                sawAnySocketRow = true
                 guard let pid = currentPID else { continue }
                 let bytesIn = Int64(cols[bytesInColIdx]) ?? 0
                 let bytesOut = Int64(cols[bytesOutColIdx]) ?? 0
                 let iface = interfaceColIdx.flatMap { $0 < cols.count ? cols[$0] : nil }
-                let isLoopback = Self.isLoopbackSocket(token: first, interfaceName: iface)
-
-                let sockKey = "\(pid)|\(first)"
-                curSockCounters[sockKey] = CounterPair(bytesIn: bytesIn, bytesOut: bytesOut)
-
-                // After Tick 1 establishes the global baseline, any newly appearing socket carries post-baseline traffic.
-                if !isFirstBaseline {
-                    let prev = prevSocketCounters[sockKey] ?? CounterPair(bytesIn: 0, bytesOut: 0)
-                    let dIn = bytesIn >= prev.bytesIn ? bytesIn - prev.bytesIn : bytesIn
-                    let dOut = bytesOut >= prev.bytesOut ? bytesOut - prev.bytesOut : bytesOut
-
-                    if isLoopback {
-                        if dIn > 0 { perPIDLoopInBytes[pid, default: 0] += dIn }
-                        if dOut > 0 { perPIDLoopOutBytes[pid, default: 0] += dOut }
-                    } else if let parsed = Self.parseSocketEndpoint(first),
-                              !Self.isLoopbackOrLinkLocal(parsed.remoteEndpoint) {
-                        if dIn > 0 { perPIDExtInBytes[pid, default: 0] += dIn }
-                        if dOut > 0 { perPIDExtOutBytes[pid, default: 0] += dOut }
-                        if dIn > 0 || dOut > 0 {
-                            sockDeltas.append(
-                                NettopSocketDelta(
-                                    pid: pid,
-                                    processName: currentProcName,
-                                    protocolName: parsed.proto,
-                                    remoteEndpoint: parsed.remoteEndpoint,
-                                    deltaBytesIn: dIn,
-                                    deltaBytesOut: dOut
-                                )
-                            )
-                        }
-                    }
-                }
+                socketRows.append(
+                    ParsedSocketRow(
+                        pid: pid,
+                        processName: currentProcName,
+                        token: first,
+                        interfaceName: iface,
+                        bytesIn: bytesIn,
+                        bytesOut: bytesOut
+                    )
+                )
             } else if let dotIdx = first.lastIndex(of: "."),
                       let pid = Int(first[first.index(after: dotIdx)...]) {
                 // Process summary row: e.g. `apsd.140,,,1429321,4782146,`
-                let name = String(first[..<dotIdx])
-                let procKey = "\(name).\(pid)"
-                let bytesIn = Int64(cols[bytesInColIdx]) ?? 0
-                let bytesOut = Int64(cols[bytesOutColIdx]) ?? 0
-
+                sawAnyProcessRow = true
                 currentPID = pid
-                currentProcName = name
-                curProcCounters[procKey] = CounterPair(bytesIn: bytesIn, bytesOut: bytesOut)
-                curProcPIDs[procKey] = pid
+                currentProcName = String(first[..<dotIdx])
             }
         }
 
-        // Fallback for collapsed `nettop -P` CSVs that contain only process summary rows and no socket child rows.
-        if !sawAnySocketRow && !isFirstBaseline {
-            for (procKey, cur) in curProcCounters {
-                guard let pid = curProcPIDs[procKey] else { continue }
-                let prev = prevProcessCounters[procKey] ?? CounterPair(bytesIn: 0, bytesOut: 0)
-                let dIn = cur.bytesIn >= prev.bytesIn ? cur.bytesIn - prev.bytesIn : cur.bytesIn
-                let dOut = cur.bytesOut >= prev.bytesOut ? cur.bytesOut - prev.bytesOut : cur.bytesOut
-                if dIn > 0 { perPIDExtInBytes[pid, default: 0] += dIn }
-                if dOut > 0 { perPIDExtOutBytes[pid, default: 0] += dOut }
+        let sawAnyDataRow = !socketRows.isEmpty || sawAnyProcessRow
+        if !sawAnyDataRow {
+            // Never consume initial baseline on empty or header-only output.
+            if hasEstablishedBaseline {
+                tickSequence += 1
+                lastSampleTime = now
+                let cutoffTick = tickSequence - maxAbsentTicks
+                if cutoffTick > 0 {
+                    prevSocketCounters = prevSocketCounters.filter { $0.value.lastSeenTick >= cutoffTick }
+                }
             }
+            return NettopSnapshotResult(
+                perPIDBytesInDelta: [:],
+                perPIDBytesOutDelta: [:],
+                externalSocketDeltas: [],
+                totalInBps: 0,
+                totalOutBps: 0
+            )
         }
 
-        prevProcessCounters = curProcCounters
-        prevSocketCounters = curSockCounters
+        let dt = max(0.5, lastSampleTime.map { now - $0 } ?? 1.0)
+        let isFirstBaseline = !hasEstablishedBaseline
+        hasEstablishedBaseline = true
+        lastSampleTime = now
+        tickSequence += 1
+
+        var perPIDExtInBytes: [Int: Int64] = [:]
+        var perPIDExtOutBytes: [Int: Int64] = [:]
+        var perPIDLoopInBytes: [Int: Int64] = [:]
+        var perPIDLoopOutBytes: [Int: Int64] = [:]
+        var sockDeltas: [NettopSocketDelta] = []
+
+        for row in socketRows {
+            let sockKey = "\(row.pid)|\(row.token)"
+            let isLoopback = Self.isLoopbackSocket(token: row.token, interfaceName: row.interfaceName)
+
+            if !isFirstBaseline {
+                let dIn: Int64
+                let dOut: Int64
+                if let prev = prevSocketCounters[sockKey] {
+                    dIn = row.bytesIn >= prev.bytesIn ? row.bytesIn - prev.bytesIn : row.bytesIn
+                    dOut = row.bytesOut >= prev.bytesOut ? row.bytesOut - prev.bytesOut : row.bytesOut
+                } else {
+                    dIn = row.bytesIn
+                    dOut = row.bytesOut
+                }
+
+                if isLoopback {
+                    if dIn > 0 { perPIDLoopInBytes[row.pid, default: 0] += dIn }
+                    if dOut > 0 { perPIDLoopOutBytes[row.pid, default: 0] += dOut }
+                } else if let parsed = Self.parseSocketEndpoint(row.token),
+                          !Self.isLoopbackOrLinkLocal(parsed.remoteEndpoint) {
+                    if dIn > 0 { perPIDExtInBytes[row.pid, default: 0] += dIn }
+                    if dOut > 0 { perPIDExtOutBytes[row.pid, default: 0] += dOut }
+                    if dIn > 0 || dOut > 0 {
+                        sockDeltas.append(
+                            NettopSocketDelta(
+                                pid: row.pid,
+                                processName: row.processName,
+                                protocolName: parsed.proto,
+                                remoteEndpoint: parsed.remoteEndpoint,
+                                deltaBytesIn: dIn,
+                                deltaBytesOut: dOut
+                            )
+                        )
+                    }
+                }
+            }
+
+            prevSocketCounters[sockKey] = RetainedCounter(
+                bytesIn: row.bytesIn,
+                bytesOut: row.bytesOut,
+                lastSeenTick: tickSequence
+            )
+        }
+
+        let cutoffTick = tickSequence - maxAbsentTicks
+        if cutoffTick > 0 {
+            prevSocketCounters = prevSocketCounters.filter { $0.value.lastSeenTick >= cutoffTick }
+        }
 
         var perPIDExtInBps: [Int: Int64] = [:]
         var perPIDExtOutBps: [Int: Int64] = [:]

@@ -27,7 +27,7 @@ echo "========================================================================"
 
 echo ""
 echo "[Step 1/3] Capturing live Flightbox snapshot via ChronoMonitor + FlightboxStore..."
-CHRONOMAC_SEED_LIVE_DB="$SEED_DB" swift test --no-parallel --filter "ChronoMacCoreTests.CLITests/captureRealLiveFlightboxWhenRequested" >/dev/null
+CHRONOMAC_RUN_LIVE_SEED=1 CHRONOMAC_SEED_LIVE_DB="$SEED_DB" swift test --no-parallel --filter "ChronoMacCoreTests.CLITests/captureRealLiveFlightboxWhenRequested" >/dev/null
 if [[ ! -f "$SEED_DB" ]]; then
     echo "FAIL: ChronoMonitor live capture did not create $SEED_DB" >&2
     exit 1
@@ -92,7 +92,7 @@ def skip_reason(cmd):
 
 def assert_tokens(cmd, doc_name, out):
     if cmd.startswith("./Scripts/test.sh"):
-        assert "Test run with" in out and "passed" in out, f"Missing pass summary in test.sh output for {doc_name}"
+        assert "[scope summary] unit_tests: passed=" in out and "skipped=" in out and "failed=0" in out, f"Missing separated pass/skip summary in test.sh output for {doc_name}:\n{out}"
         return
 
     if "--json" in cmd:
@@ -207,7 +207,7 @@ for doc_name, mcp_list in (("README.md", en_mcp), ("README.zh-CN.md", zh_mcp)):
         executed_count += 1
         print(f"  [PASS] ({doc_name} JSON block #{block_idx}) `ChronoMac {' '.join(mcp_args)}` -> exit=0 | 5 JSON-RPC responses verified")
 
-print(f"\nSummary: executed={executed_count}, skipped={skipped_count} (all with explicit reasons).")
+print(f"\nSummary: passed={executed_count}, skipped={skipped_count}, failed=0 (all skips with explicit reasons).")
 PY
 
 echo ""

@@ -235,14 +235,21 @@ struct CLITests {
         #expect(!FileManager.default.fileExists(atPath: missingDBPath))
     }
 
-    @Test("W3 Helper: Captures real live host telemetry via ChronoMonitor and FlightboxStore when CHRONOMAC_SEED_LIVE_DB is set")
+    @Test(
+        "W3 Helper: Captures real live host telemetry via ChronoMonitor and FlightboxStore when CHRONOMAC_RUN_LIVE_SEED=1",
+        .enabled(
+            if: ProcessInfo.processInfo.environment["CHRONOMAC_RUN_LIVE_SEED"] == "1",
+            "Opt-in live DB seeder; set CHRONOMAC_RUN_LIVE_SEED=1 and CHRONOMAC_SEED_LIVE_DB=<path> to run"
+        )
+    )
     @MainActor
     func captureRealLiveFlightboxWhenRequested() throws {
-        guard let liveDBPath = ProcessInfo.processInfo.environment["CHRONOMAC_SEED_LIVE_DB"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-              !liveDBPath.isEmpty else {
-            return
-        }
+        let liveDBPath = try #require(
+            ProcessInfo.processInfo.environment["CHRONOMAC_SEED_LIVE_DB"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            "CHRONOMAC_SEED_LIVE_DB must be set when CHRONOMAC_RUN_LIVE_SEED=1"
+        )
+        #expect(!liveDBPath.isEmpty)
 
         let dbURL = URL(fileURLWithPath: liveDBPath)
         try? FileManager.default.removeItem(at: dbURL)

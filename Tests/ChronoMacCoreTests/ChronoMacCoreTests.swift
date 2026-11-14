@@ -277,4 +277,117 @@ struct ChronoMacCoreTests {
         #expect(ThermalGrade.serious.label(in: .zhHans) == "降频限温")
         #expect(AnomalyKind.swapSurge.label(in: .zhHans) == "交换激增")
     }
+
+    @Test("T18: AppLocalizer default init uses isolated in-memory store without touching UserDefaults.standard and Sources contain zero runtime bundle/test checks")
+    @MainActor
+    func appLocalizerEntryPointInjectionAndZeroEnvironmentBranching() throws {
+        // 1. Static source scan across Sources/ChronoMacCore and Sources/ChronoMac: zero .app / test-runner environment checks
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourcesDir = repoRoot.appendingPathComponent("Sources")
+        let forbiddenTokens = [
+            "bundlePath",
+            ".hasSuffix(\".app\")",
+            "XCTest",
+            "XCTestConfigurationFilePath",
+            "SWIFT_TESTING"
+        ]
+        let enumerator = try #require(FileManager.default.enumerator(at: sourcesDir, includingPropertiesForKeys: nil))
+        var violations: [String] = []
+        for case let fileURL as URL in enumerator where fileURL.pathExtension == "swift" {
+            let content = try String(contentsOf: fileURL, encoding: .utf8)
+            let relPath = fileURL.path.replacingOccurrences(of: repoRoot.path + "/", with: "")
+            for tok in forbiddenTokens where content.contains(tok) {
+                violations.append("\(relPath) contains '\(tok)'")
+            }
+        }
+        #expect(violations.isEmpty, "Forbidden runtime environment branching in Sources/: \(violations)")
+
+        // 2. Default AppLocalizer() uses an isolated InMemoryPreferenceStore (0 writes to UserDefaults.standard)
+        let testKey = "io.github.zxu756.ChronoMac.t18.verify"
+        let beforeStandard = UserDefaults.standard.object(forKey: AppLocalizer.bundleLanguageKey) as? String
+        let beforeCustom = UserDefaults.standard.object(forKey: testKey) as? String
+
+        let zeroArgLoc = AppLocalizer()
+        #expect(zeroArgLoc.preferenceStore is InMemoryPreferenceStore)
+        zeroArgLoc.setLanguage(.zhHans)
+        zeroArgLoc.setLanguage(.en)
+
+        let defaultLoc = AppLocalizer(arguments: ["ChronoMac"], preferredLanguages: ["en-US"], defaultsKey: testKey)
+        #expect(defaultLoc.preferenceStore is InMemoryPreferenceStore)
+        #expect(defaultLoc.language == .en)
+        defaultLoc.setLanguage(.zhHans)
+        #expect(defaultLoc.language == .zhHans)
+        #expect(defaultLoc.preferenceStore.string(forKey: testKey) == "zh-Hans")
+        defaultLoc.setLanguage(.en)
+        #expect(defaultLoc.language == .en)
+        #expect(defaultLoc.preferenceStore.string(forKey: testKey) == "en")
+
+        #expect(UserDefaults.standard.object(forKey: AppLocalizer.bundleLanguageKey) as? String == beforeStandard)
+        #expect(UserDefaults.standard.object(forKey: testKey) as? String == beforeCustom)
+
+        // 3. AppLocalizer(preferenceStore: UserDefaultsPreferenceStore(...)) persists into the injected UserDefaults instance
+        let injectedDefaults = EphemeralMemoryUserDefaults()
+        let udStore = UserDefaultsPreferenceStore(injectedDefaults)
+        let persistedLoc = AppLocalizer(
+            arguments: ["ChronoMac"],
+            preferenceStore: udStore,
+            preferredLanguages: ["en-US"],
+            defaultsKey: testKey
+        )
+        #expect(persistedLoc.language == .en)
+        persistedLoc.setLanguage(.zhHans)
+        #expect(injectedDefaults.string(forKey: testKey) == "zh-Hans")
+
+        let reloadedLoc = AppLocalizer(
+            arguments: ["ChronoMac"],
+            preferenceStore: UserDefaultsPreferenceStore(injectedDefaults),
+            preferredLanguages: ["en-US"],
+            defaultsKey: testKey
+        )
+        #expect(reloadedLoc.language == .zhHans)
+    }
+}
+
+/// Pure in-memory `UserDefaults` test double so `UserDefaultsPreferenceStore` is exercised end-to-end
+/// without invoking `cfprefsd` or creating `.plist` files under `~/Library/Preferences`.
+private final class EphemeralMemoryUserDefaults: UserDefaults, @unchecked Sendable {
+    private var values: [String: Any] = [:]
+    private let lock = NSLock()
+
+    override init?(suiteName suitename: String?) {
+        super.init(suiteName: nil)
+    }
+
+    convenience init() {
+        self.init(suiteName: nil)!
+    }
+
+    override func object(forKey defaultName: String) -> Any? {
+        lock.lock()
+        defer { lock.unlock() }
+        return values[defaultName]
+    }
+
+    override func string(forKey defaultName: String) -> String? {
+        object(forKey: defaultName) as? String
+    }
+
+    override func set(_ value: Any?, forKey defaultName: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        if let value {
+            values[defaultName] = value
+        } else {
+            values.removeValue(forKey: defaultName)
+        }
+    }
+
+    override func removeObject(forKey defaultName: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        values.removeValue(forKey: defaultName)
+    }
 }

@@ -59,6 +59,22 @@ public protocol PreferenceStore: AnyObject {
 
 extension UserDefaults: PreferenceStore {}
 
+public final class UserDefaultsPreferenceStore: PreferenceStore, @unchecked Sendable {
+    public let userDefaults: UserDefaults
+
+    public init(_ userDefaults: UserDefaults = .standard) {
+        self.userDefaults = userDefaults
+    }
+
+    public func string(forKey defaultName: String) -> String? {
+        userDefaults.string(forKey: defaultName)
+    }
+
+    public func set(_ value: Any?, forKey defaultName: String) {
+        userDefaults.set(value, forKey: defaultName)
+    }
+}
+
 public final class InMemoryPreferenceStore: PreferenceStore, @unchecked Sendable {
     private var storage: [String: String]
     private let lock = NSLock()
@@ -90,17 +106,12 @@ public final class AppLocalizer: ObservableObject {
     public static let shared = AppLocalizer()
 
     @Published public private(set) var language: AppLanguage
-
-    private let preferenceStore: (any PreferenceStore)?
-    private let defaultsKey: String
-
-    public nonisolated static func defaultPreferenceStore() -> (any PreferenceStore)? {
-        Bundle.main.bundlePath.hasSuffix(".app") ? UserDefaults.standard : nil
-    }
+    public private(set) var preferenceStore: any PreferenceStore
+    private var defaultsKey: String
 
     public init(
         arguments: [String] = CommandLine.arguments,
-        preferenceStore: (any PreferenceStore)? = AppLocalizer.defaultPreferenceStore(),
+        preferenceStore: any PreferenceStore = InMemoryPreferenceStore(),
         preferredLanguages: [String] = Locale.preferredLanguages,
         defaultsKey: String = AppLocalizer.bundleLanguageKey
     ) {
@@ -116,12 +127,44 @@ public final class AppLocalizer: ObservableObject {
 
     public init(
         language: AppLanguage,
-        preferenceStore: (any PreferenceStore)? = nil,
+        preferenceStore: any PreferenceStore = InMemoryPreferenceStore(),
         defaultsKey: String = AppLocalizer.bundleLanguageKey
     ) {
         self.preferenceStore = preferenceStore
         self.defaultsKey = defaultsKey
         self.language = language
+    }
+
+    @discardableResult
+    public static func configureShared(
+        arguments: [String] = CommandLine.arguments,
+        preferenceStore: any PreferenceStore,
+        preferredLanguages: [String] = Locale.preferredLanguages,
+        defaultsKey: String = AppLocalizer.bundleLanguageKey
+    ) -> AppLocalizer {
+        shared.configure(
+            arguments: arguments,
+            preferenceStore: preferenceStore,
+            preferredLanguages: preferredLanguages,
+            defaultsKey: defaultsKey
+        )
+        return shared
+    }
+
+    public func configure(
+        arguments: [String] = CommandLine.arguments,
+        preferenceStore: any PreferenceStore,
+        preferredLanguages: [String] = Locale.preferredLanguages,
+        defaultsKey: String = AppLocalizer.bundleLanguageKey
+    ) {
+        self.preferenceStore = preferenceStore
+        self.defaultsKey = defaultsKey
+        self.language = Self.resolveLanguage(
+            arguments: arguments,
+            preferenceStore: preferenceStore,
+            preferredLanguages: preferredLanguages,
+            defaultsKey: defaultsKey
+        )
     }
 
     public nonisolated static func resolveLanguage(
@@ -154,7 +197,7 @@ public final class AppLocalizer: ObservableObject {
 
     public func setLanguage(_ newLanguage: AppLanguage) {
         language = newLanguage
-        preferenceStore?.set(newLanguage.rawValue, forKey: defaultsKey)
+        preferenceStore.set(newLanguage.rawValue, forKey: defaultsKey)
     }
 
     public func toggle() {

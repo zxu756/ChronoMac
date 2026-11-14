@@ -238,12 +238,29 @@ elif mode == "cutoff_unaligned":
     old = "let alignedCutoff = (cutoff / bucketSec) * bucketSec"
     new = "let alignedCutoff = cutoff"
 elif mode == "conflict_replace":
-    old = "INSERT INTO system_ticks ("
-    new = "INSERT OR REPLACE INTO system_ticks ("
-    if old not in text:
+    anchor = text.find("private func compactTier(")
+    if anchor < 0:
         sys.exit(3)
-    text = text.replace(old, new, 1)
-    start_idx = text.index("ON CONFLICT(ts) DO UPDATE SET")
+    old = "INSERT INTO system_ticks ("
+    ins_idx = text.find(old, anchor)
+    if ins_idx < 0:
+        sys.exit(3)
+    text = text[:ins_idx] + "INSERT OR REPLACE INTO system_ticks (" + text[ins_idx + len(old):]
+    start_idx = text.index("ON CONFLICT(ts) DO UPDATE SET", ins_idx)
+    end_idx = text.index("END;", start_idx) + len("END;")
+    text = text[:start_idx] + ";" + text[end_idx:]
+    open(path, "w", encoding="utf-8").write(text)
+    sys.exit(0)
+elif mode == "insert_tick_replace":
+    anchor = text.find("private func insertTick(")
+    if anchor < 0:
+        sys.exit(3)
+    old = "INSERT INTO system_ticks ("
+    ins_idx = text.find(old, anchor)
+    if ins_idx < 0:
+        sys.exit(3)
+    text = text[:ins_idx] + "INSERT OR REPLACE INTO system_ticks (" + text[ins_idx + len(old):]
+    start_idx = text.index("ON CONFLICT(ts) DO UPDATE SET", ins_idx)
     end_idx = text.index("END;", start_idx) + len("END;")
     text = text[:start_idx] + ";" + text[end_idx:]
     open(path, "w", encoding="utf-8").write(text)
@@ -316,13 +333,18 @@ run_mutation_check "conflict_replace" \
     "ChronoMacCoreTests.StoreTests/thirtyHourSlidingCompactionPreservesAll90Spikes" \
     "conflict_replace"
 
+run_mutation_check "insert_tick_replace" \
+    "Sources/ChronoMacCore/Storage/FlightboxStore.swift" \
+    "ChronoMacCoreTests.StoreTests/sameTimestampCompactedPeakPreservedAgainstLateLowSample" \
+    "insert_tick_replace"
+
 run_mutation_check "nettop_drop_new_pid" \
     "Sources/ChronoMacCore/Collectors/NettopDeltaParser.swift" \
     "ChronoMacCoreTests.SamplerTests/postBaselineNewProcessTrafficAttributedNotDropped" \
     "nettop_drop_new_pid"
 
 rm -rf "$MUT_REPO"
-echo "  -> PASS [Row 6]: All 6 isolated code mutations compiled cleanly and failed their specific guard tests."
+echo "  -> PASS [Row 6]: All 7 isolated code mutations compiled cleanly and failed their specific guard tests."
 
 # ------------------------------------------------------------------------
 # Final Safety Verification: User's real flightbox.sqlite untouched
@@ -338,6 +360,7 @@ if [[ -n "$BEFORE_REAL_SHA" ]]; then
 fi
 
 echo ""
+echo "Summary: passed=6, skipped=0, failed=0"
 echo "========================================================================"
 echo "ALL 6 M0 ACCEPTANCE ROWS PASSED"
 echo "========================================================================"

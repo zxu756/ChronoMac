@@ -88,6 +88,85 @@ struct StoreTests {
         #expect(blamed.contains(where: { $0.pid == 8888 && $0.name == "spike-culprit" }))
     }
 
+    @Test("T16: Same timestamp write high peak -> compact to Tier 1 -> write low sample preserves all metric peaks and compacted tier")
+    func sameTimestampCompactedPeakPreservedAgainstLateLowSample() throws {
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("chronomac-t16-same-ts-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        let dbURL = tmpDir.appendingPathComponent("flightbox.sqlite")
+        let store = try FlightboxStore(databaseURL: dbURL)
+
+        let bucketBase: Int64 = 1_800_000_000 // exact multiple of 60 and 15
+
+        // 1. Write high-value peak sample at ts == bucketBase
+        let highPeakTick = SystemTick(
+            ts: bucketBase,
+            tier: .raw2s,
+            cpuUserPct: 85.0,
+            cpuSysPct: 10.0, // totalCPUPct == 95.0%
+            thermalGrade: .serious,
+            memUsedBytes: 18_000_000_000,
+            memTotalBytes: 24_000_000_000,
+            swapUsedBytes: 3_200_000_000,
+            diskReadBps: 120_000_000,
+            diskWriteBps: 80_000_000,
+            netInBps: 45_000_000,
+            netOutBps: 30_000_000,
+            loopbackInBps: 200_000_000,
+            loopbackOutBps: 200_000_000,
+            activeAgentCount: 2,
+            activeAgentSummary: "Claude Code, Codex"
+        )
+        try store.recordSampleBatch(tick: highPeakTick, processes: [], sockets: [], anomalies: [])
+
+        // 2. Compact bucket [bucketBase, bucketBase + 15) into Tier 1 (rollup15s)
+        try store.runRollupAndRetention(now: bucketBase + 7_200 + 30)
+        let afterCompaction = store.queryTicks(from: bucketBase, to: bucketBase)
+        #expect(afterCompaction.count == 1)
+        #expect(afterCompaction.first?.tier == .rollup15s)
+        #expect(afterCompaction.first?.totalCPUPct == 95.0)
+
+        // 3. Write a low-value raw sample at the EXACT SAME timestamp ts == bucketBase
+        let sameTsLowTick = SystemTick(
+            ts: bucketBase,
+            tier: .raw2s,
+            cpuUserPct: 3.0,
+            cpuSysPct: 1.0, // totalCPUPct == 4.0%
+            thermalGrade: .nominal,
+            memUsedBytes: 6_000_000_000,
+            memTotalBytes: 24_000_000_000,
+            swapUsedBytes: 64_000_000,
+            diskReadBps: 4_096,
+            diskWriteBps: 2_048,
+            netInBps: 1_024,
+            netOutBps: 512,
+            loopbackInBps: 0,
+            loopbackOutBps: 0,
+            activeAgentCount: 0,
+            activeAgentSummary: ""
+        )
+        try store.recordSampleBatch(tick: sameTsLowTick, processes: [], sockets: [], anomalies: [])
+
+        // 4. Verify compacted tier and all peak metrics survive without overwrite
+        let rows = store.queryTicks(from: bucketBase, to: bucketBase)
+        let preserved = try #require(rows.first)
+        #expect(rows.count == 1)
+        #expect(preserved.tier == .rollup15s)
+        #expect(preserved.totalCPUPct == 95.0)
+        #expect(preserved.cpuUserPct == 85.0)
+        #expect(preserved.cpuSysPct == 10.0)
+        #expect(preserved.thermalGrade == .serious)
+        #expect(preserved.memUsedBytes == 18_000_000_000)
+        #expect(preserved.swapUsedBytes == 3_200_000_000)
+        #expect(preserved.diskReadBps == 120_000_000)
+        #expect(preserved.diskWriteBps == 80_000_000)
+        #expect(preserved.netInBps == 45_000_000)
+        #expect(preserved.netOutBps == 30_000_000)
+        #expect(preserved.loopbackInBps == 200_000_000)
+        #expect(preserved.loopbackOutBps == 200_000_000)
+        #expect(preserved.activeAgentCount == 2)
+        #expect(preserved.activeAgentSummary == "Claude Code, Codex")
+    }
+
     @Test("T1 Acceptance Row 1: 30-hour synthetic stream (90 spikes every 20m, compaction every 60s) preserves all 90 spikes")
     func thirtyHourSlidingCompactionPreservesAll90Spikes() throws {
         let exportPath = ProcessInfo.processInfo.environment["CHRONOMAC_ROW1_EXPORT_DB"]?.trimmingCharacters(in: .whitespacesAndNewlines)

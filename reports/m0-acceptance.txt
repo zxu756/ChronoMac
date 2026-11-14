@@ -8,9 +8,9 @@ ChronoMac M0 Acceptance Suite (Isolated Temp Dir)
 ↳ Target Platform: arm64e-apple-macos14.0
 ◇ Suite "Store Tests" started.
 ◇ Test "T1 Acceptance Row 1: 30-hour synthetic stream (90 spikes every 20m, compaction every 60s) preserves all 90 spikes" started.
-✔ Test "T1 Acceptance Row 1: 30-hour synthetic stream (90 spikes every 20m, compaction every 60s) preserves all 90 spikes" passed after 3.903 seconds.
-✔ Suite "Store Tests" passed after 3.903 seconds.
-✔ Test run with 1 test in 1 suite passed after 3.903 seconds.
+✔ Test "T1 Acceptance Row 1: 30-hour synthetic stream (90 spikes every 20m, compaction every 60s) preserves all 90 spikes" passed after 5.016 seconds.
+✔ Suite "Store Tests" passed after 5.016 seconds.
+✔ Test run with 1 test in 1 suite passed after 5.016 seconds.
   -> SQLite verification: surviving_spikes=90 / 90 (tick_peaks=90, split_buckets=0, total_rows=9233)
   -> PASS [Row 1]: 90 / 90 spikes and culprit snapshots preserved across half-bucket boundaries.
 
@@ -20,9 +20,9 @@ ChronoMac M0 Acceptance Suite (Isolated Temp Dir)
 ↳ Target Platform: arm64e-apple-macos14.0
 ◇ Suite "Store Tests" started.
 ◇ Test "T2 Acceptance Row 2: 2 MB storage cap trims 10 MB of <48h data including WAL and reclaims free pages" started.
-✔ Test "T2 Acceptance Row 2: 2 MB storage cap trims 10 MB of <48h data including WAL and reclaims free pages" passed after 0.771 seconds.
-✔ Suite "Store Tests" passed after 0.771 seconds.
-✔ Test run with 1 test in 1 suite passed after 0.771 seconds.
+✔ Test "T2 Acceptance Row 2: 2 MB storage cap trims 10 MB of <48h data including WAL and reclaims free pages" passed after 1.076 seconds.
+✔ Suite "Store Tests" passed after 1.077 seconds.
+✔ Test run with 1 test in 1 suite passed after 1.077 seconds.
   -> Disk bytes after retention: db=2023424 wal=0 shm=32768 total=2056192 (cap=2097152, freelist_count=0)
   -> PASS [Row 2]: Total storage (2056192 B) <= 2 MB (2097152 B).
 
@@ -32,27 +32,27 @@ ChronoMac M0 Acceptance Suite (Isolated Temp Dir)
 ↳ Target Platform: arm64e-apple-macos14.0
 ◇ Suite "Sampler Tests" started.
 ◇ Test "T3 Acceptance Row 3: Live recording session during 200 MB TCP 127.0.0.1 transfer between two local processes leaves external totals untouched and triggers 0 anomalies" started.
-✔ Test "T3 Acceptance Row 3: Live recording session during 200 MB TCP 127.0.0.1 transfer between two local processes leaves external totals untouched and triggers 0 anomalies" passed after 1.409 seconds.
-✔ Suite "Sampler Tests" passed after 1.409 seconds.
-✔ Test run with 1 test in 1 suite passed after 1.409 seconds.
-  -> SQLite verification: peak_loopback_in_bps=172622087 peak_loopback_out_bps=172622087 ext_in_delta_bps=1106 ext_out_delta_bps=65788 ext_total_implied_bytes=133788 loopback_rows_in_socket_ledger=0 net_anomalies=0
+✔ Test "T3 Acceptance Row 3: Live recording session during 200 MB TCP 127.0.0.1 transfer between two local processes leaves external totals untouched and triggers 0 anomalies" passed after 1.756 seconds.
+✔ Suite "Sampler Tests" passed after 1.756 seconds.
+✔ Test run with 1 test in 1 suite passed after 1.756 seconds.
+  -> SQLite verification: peak_loopback_in_bps=104857600 peak_loopback_out_bps=104857600 ext_in_delta_bps=1038 ext_out_delta_bps=165383 ext_total_implied_bytes=332842 loopback_rows_in_socket_ledger=0 net_anomalies=0
   -> CLI anomalies (EN): No anomaly bookmarks recorded in this window.
   -> CLI anomalies (ZH): 窗口内未检测到异常书签。
-  -> PASS [Row 3]: External inbound/outbound did not jump by 200 MB (ext_in_delta_bps=1106, ext_out_delta_bps=65788); 0 network anomalies.
+  -> PASS [Row 3]: External inbound/outbound did not jump by 200 MB (ext_in_delta_bps=1038, ext_out_delta_bps=165383); 0 network anomalies.
 
 [Row 4/6] 5 consecutive runs of ChronoMac --cli status vs live top (in --lang en and --lang zh)...
   -- Language: en --
-    Run 1 (en): ChronoMac=55.9% | top=56.3% | diff=0.4 pp -> OK
-    Run 2 (en): ChronoMac=62.4% | top=58.5% | diff=3.9 pp -> OK
-    Run 3 (en): ChronoMac=37.5% | top=38.4% | diff=0.9 pp -> OK
-    Run 4 (en): ChronoMac=34.6% | top=34.6% | diff=0.0 pp -> OK
-    Run 5 (en): ChronoMac=30.5% | top=32.7% | diff=2.2 pp -> OK
+    Run 1 (en): ChronoMac=36.8% | top=36.3% | diff=0.5 pp -> OK
+    Run 2 (en): ChronoMac=65.8% | top=63.4% | diff=2.4 pp -> OK
+    Run 3 (en): ChronoMac=56.8% | top=56.8% | diff=0.0 pp -> OK
+    Run 4 (en): ChronoMac=57.2% | top=57.8% | diff=0.6 pp -> OK
+    Run 5 (en): ChronoMac=50.9% | top=47.9% | diff=3.0 pp -> OK
   -- Language: zh --
-    Run 1 (zh): ChronoMac=51.4% | top=51.9% | diff=0.5 pp -> OK
-    Run 2 (zh): ChronoMac=48.4% | top=50.2% | diff=1.8 pp -> OK
-    Run 3 (zh): ChronoMac=39.9% | top=41.5% | diff=1.6 pp -> OK
-    Run 4 (zh): ChronoMac=42.8% | top=38.5% | diff=4.3 pp -> OK
-    Run 5 (zh): ChronoMac=27.4% | top=26.9% | diff=0.5 pp -> OK
+    Run 1 (zh): ChronoMac=48.0% | top=47.5% | diff=0.5 pp -> OK
+    Run 2 (zh): ChronoMac=42.8% | top=42.0% | diff=0.8 pp -> OK
+    Run 3 (zh): ChronoMac=58.3% | top=57.8% | diff=0.5 pp -> OK
+    Run 4 (zh): ChronoMac=56.4% | top=60.6% | diff=4.2 pp -> OK
+    Run 5 (zh): ChronoMac=55.8% | top=51.9% | diff=3.9 pp -> OK
   -> PASS [Row 4]: All 10 calibrated runs (5 EN + 5 ZH) > 0.0% and within <= 10.0 pp of top.
 
 [Row 5/6] Unknown subcommand 'ChronoMac --cli bogus' returns exit code 2 (EN & ZH)...
@@ -61,16 +61,16 @@ ChronoMac M0 Acceptance Suite (Isolated Temp Dir)
   -> PASS [Row 5]: Exit code 2 verified in both EN and ZH.
 
 [Row 6/6] Running real fault-injection mutations in isolated temp workspace...
-  -> Mutation [cpu_zero] caught cleanly (compile=0, test_rc=1): ✘ Test "T7 & T10: Real ProcessTreeSampler measures non-zero CPU & memory footprint on current process and surfaces EPERM processes as No permission" failed after 1.076 seconds with 1 issue.
-  -> Mutation [mem_zero] caught cleanly (compile=0, test_rc=1): ✘ Test "T7 & T10: Real ProcessTreeSampler measures non-zero CPU & memory footprint on current process and surfaces EPERM processes as No permission" failed after 0.463 seconds with 1 issue.
-  -> Mutation [cap_off] caught cleanly (compile=0, test_rc=1): ✘ Test "T2 Acceptance Row 2: 2 MB storage cap trims 10 MB of <48h data including WAL and reclaims free pages" failed after 0.957 seconds with 1 issue.
-  -> Mutation [cutoff_unaligned] caught cleanly (compile=0, test_rc=1): ✘ Test "T1 Acceptance Row 1: 30-hour synthetic stream (90 spikes every 20m, compaction every 60s) preserves all 90 spikes" failed after 5.786 seconds with 1 issue.
-  -> Mutation [conflict_replace] caught cleanly (compile=0, test_rc=1): ✘ Test "T1 Acceptance Row 1: 30-hour synthetic stream (90 spikes every 20m, compaction every 60s) preserves all 90 spikes" failed after 5.191 seconds with 1 issue.
-  -> Mutation [nettop_drop_new_pid] caught cleanly (compile=0, test_rc=1): ✘ Test "T13: Two-tick CSV where curl.999 newly appears on Tick 2 with 40 MB attributes 40 MB to curl.999 instead of dropping to 0" failed after 0.003 seconds with 7 issues.
-  -> PASS [Row 6]: All 6 isolated code mutations compiled cleanly and failed their specific guard tests.
+  -> Mutation [cpu_zero] caught cleanly (compile=0, test_rc=1): ✘ Test "T7 & T10: Real ProcessTreeSampler measures non-zero CPU & memory footprint on current process and surfaces EPERM processes as No permission" failed after 0.770 seconds with 1 issue.
+  -> Mutation [mem_zero] caught cleanly (compile=0, test_rc=1): ✘ Test "T7 & T10: Real ProcessTreeSampler measures non-zero CPU & memory footprint on current process and surfaces EPERM processes as No permission" failed after 0.367 seconds with 1 issue.
+  -> Mutation [cap_off] caught cleanly (compile=0, test_rc=1): ✘ Test "T2 Acceptance Row 2: 2 MB storage cap trims 10 MB of <48h data including WAL and reclaims free pages" failed after 0.674 seconds with 1 issue.
+  -> Mutation [cutoff_unaligned] caught cleanly (compile=0, test_rc=1): ✘ Test "T1 Acceptance Row 1: 30-hour synthetic stream (90 spikes every 20m, compaction every 60s) preserves all 90 spikes" failed after 11.345 seconds with 1 issue.
+  -> Mutation [conflict_replace] caught cleanly (compile=0, test_rc=1): ✘ Test "T1 Acceptance Row 1: 30-hour synthetic stream (90 spikes every 20m, compaction every 60s) preserves all 90 spikes" failed after 3.801 seconds with 1 issue.
+  -> Mutation [insert_tick_replace] caught cleanly (compile=0, test_rc=1): ✘ Test "T16: Same timestamp write high peak -> compact to Tier 1 -> write low sample preserves all metric peaks and compacted tier" failed after 0.010 seconds with 15 issues.
+  -> Mutation [nettop_drop_new_pid] caught cleanly (compile=0, test_rc=1): ✘ Test "T13: Two-tick CSV where curl.999 newly appears on Tick 2 with 40 MB attributes 40 MB to curl.999 instead of dropping to 0" failed after 0.001 seconds with 7 issues.
+  -> PASS [Row 6]: All 7 isolated code mutations compiled cleanly and failed their specific guard tests.
 
-[DB Safety] Verified user flightbox.sqlite untouched (SHA-256: f87d4c0ee94513212d3cd18247ced963c58959a51221d46e88b42e7831d8ba43).
-
+Summary: passed=6, skipped=0, failed=0
 ========================================================================
 ALL 6 M0 ACCEPTANCE ROWS PASSED
 ========================================================================

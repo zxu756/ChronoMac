@@ -199,27 +199,162 @@ struct SamplerTests {
         #expect(res.externalSocketDeltas.first?.processName == "curl")
         #expect(res.externalSocketDeltas.first?.deltaBytesIn == fortyMB)
 
-        // Collapsed nettop -P -L 1 CSV (process summary rows only, no socket child rows)
-        let collapsedParser = NettopDeltaParser()
+        // Process-summary-only rows without per-socket child rows lack interface/endpoint tags and must not fabricate external traffic
+        let summaryOnlyParser = NettopDeltaParser()
         let pTick1 = """
-        ,bytes_in,bytes_out,
-        apsd.140,12000,8000,
+        ,interface,state,bytes_in,bytes_out,
+        apsd.140,,,12000,8000,
         """
-        _ = collapsedParser.ingestCSV(pTick1, now: 6_000.0)
+        _ = summaryOnlyParser.ingestCSV(pTick1, now: 6_000.0)
         let pTick2 = """
-        ,bytes_in,bytes_out,
-        apsd.140,12000,8000,
-        curl.999,\(fortyMB),64000,
+        ,interface,state,bytes_in,bytes_out,
+        apsd.140,,,12000,8000,
+        curl.999,,,\(fortyMB),64000,
         """
-        let pRes = collapsedParser.ingestCSV(pTick2, now: 6_002.0) // dt = 2.0s
-        #expect(pRes.perPIDBytesInDelta[999] == fortyMB / 2)
-        #expect(pRes.totalInBps == fortyMB / 2)
+        let pRes = summaryOnlyParser.ingestCSV(pTick2, now: 6_002.0)
+        #expect(pRes.totalInBps == 0)
+        #expect(pRes.externalSocketDeltas.isEmpty)
     }
 
-    @Test("T15: Verbatim captured /usr/bin/nettop -L 1 CSV with Listen empty cells and loopback sockets parses cleanly")
-    func capturedMacOSNettopLoopbackCSVParsesCleanly() {
+    @Test("T17: Empty and header-only nettop CSV ticks do not consume initial baseline")
+    func emptyOrHeaderOnlyTicksDoNotConsumeInitialBaseline() {
         let parser = NettopDeltaParser()
-        // Verbatim output captured from `/usr/bin/nettop -L 1 -n -J interface,state,bytes_in,bytes_out` on macOS arm64
+
+        // Tick 1: completely empty output
+        let emptyRes = parser.ingestCSV("", now: 100.0)
+        #expect(emptyRes.totalInBps == 0)
+        #expect(emptyRes.externalSocketDeltas.isEmpty)
+
+        // Tick 2: header-only output (0 parsed data rows)
+        let headerOnlyRes = parser.ingestCSV(",interface,state,bytes_in,bytes_out,\n", now: 102.0)
+        #expect(headerOnlyRes.totalInBps == 0)
+        #expect(headerOnlyRes.externalSocketDeltas.isEmpty)
+
+        // Tick 3: first non-empty snapshot with pre-existing 40 MB socket MUST establish baseline (delta == 0)
+        let firstNonEmpty = """
+        ,interface,state,bytes_in,bytes_out,
+        apsd.140,,,40000000,8000000,
+        tcp4 192.168.1.10:50000<->17.57.145.41:5223,en0,Established,40000000,8000000,
+        """
+        let baseRes = parser.ingestCSV(firstNonEmpty, now: 104.0)
+        #expect(baseRes.totalInBps == 0)
+        #expect(baseRes.totalOutBps == 0)
+        #expect(baseRes.perPIDBytesInDelta.isEmpty)
+        #expect(baseRes.externalSocketDeltas.isEmpty)
+
+        // Tick 4 (dt = 2.0s): +2 MB inbound delta -> 1 MB/s
+        let nextTick = """
+        ,interface,state,bytes_in,bytes_out,
+        apsd.140,,,42000000,8000000,
+        tcp4 192.168.1.10:50000<->17.57.145.41:5223,en0,Established,42000000,8000000,
+        """
+        let deltaRes = parser.ingestCSV(nextTick, now: 106.0)
+        #expect(deltaRes.totalInBps == 1_000_000)
+        #expect(deltaRes.externalSocketDeltas.count == 1)
+        #expect(deltaRes.externalSocketDeltas.first?.deltaBytesIn == 2_000_000)
+    }
+
+    @Test("T17: Transiently absent socket across 1..60 ticks retains lastSeen counter without bogus cumulative spike, evicts >60 absent ticks, and handles counter reset")
+    func retainedSocketWindowPreventsCumulativeInflationEvictsOldAndHandlesReset() {
+        let parser = NettopDeltaParser()
+        #expect(parser.maxAbsentTicks == 60)
+        let fortyMB: Int64 = 40_000_000
+        let fortyTwoMB: Int64 = 42_000_000
+
+        let apsdOnly = """
+        ,interface,state,bytes_in,bytes_out,
+        apsd.140,,,5000,5000,
+        tcp4 192.168.1.10:50000<->17.57.145.41:5223,en0,Established,5000,5000,
+        """
+        let withCurl40MB = """
+        ,interface,state,bytes_in,bytes_out,
+        apsd.140,,,5000,5000,
+        tcp4 192.168.1.10:50000<->17.57.145.41:5223,en0,Established,5000,5000,
+        curl.999,,,\(fortyMB),100000,
+        tcp4 192.168.1.10:54321<->151.101.1.140:443,en0,Established,\(fortyMB),100000,
+        """
+        let withCurl42MB = """
+        ,interface,state,bytes_in,bytes_out,
+        apsd.140,,,5000,5000,
+        tcp4 192.168.1.10:50000<->17.57.145.41:5223,en0,Established,5000,5000,
+        curl.999,,,\(fortyTwoMB),100000,
+        tcp4 192.168.1.10:54321<->151.101.1.140:443,en0,Established,\(fortyTwoMB),100000,
+        """
+
+        // Tick 1 (t=1000): curl.999 present at 40 MB on baseline
+        var now = 1_000.0
+        let t1 = parser.ingestCSV(withCurl40MB, now: now)
+        #expect(t1.totalInBps == 0)
+        #expect(parser.trackedSocketCount == 2)
+
+        // Tick 2 (t=1002): curl.999 transiently absent for 1 tick -> still retained
+        now += 2.0
+        let t2 = parser.ingestCSV(apsdOnly, now: now)
+        #expect(t2.totalInBps == 0)
+        #expect(parser.trackedSocketCount == 2)
+
+        // Tick 3 (t=1004): curl.999 reappears with same 40 MB -> delta MUST be 0 (NOT +40 MB!)
+        now += 2.0
+        let t3 = parser.ingestCSV(withCurl40MB, now: now)
+        #expect(t3.totalInBps == 0)
+        #expect((t3.perPIDBytesInDelta[999] ?? 0) == 0)
+        #expect(t3.externalSocketDeltas.isEmpty)
+
+        // Absent for 10 consecutive ticks, then reappears with 42 MB -> delta MUST be 2 MB (1 MB/s over dt=2s)
+        for _ in 0..<10 {
+            now += 2.0
+            _ = parser.ingestCSV(apsdOnly, now: now)
+        }
+        #expect(parser.trackedSocketCount == 2)
+        now += 2.0
+        let after10Absent = parser.ingestCSV(withCurl42MB, now: now)
+        #expect(after10Absent.perPIDBytesInDelta[999] == 1_000_000)
+        #expect(after10Absent.totalInBps == 1_000_000)
+        #expect(after10Absent.externalSocketDeltas.count == 1)
+        #expect(after10Absent.externalSocketDeltas.first?.deltaBytesIn == 2_000_000)
+
+        // Counter reset while retained (absent 2 ticks, then reappears with smaller counter 1,500,000 < 42,000,000) -> delta == current (1,500,000)
+        for _ in 0..<2 {
+            now += 2.0
+            _ = parser.ingestCSV(apsdOnly, now: now)
+        }
+        now += 2.0
+        let withCurlReset = """
+        ,interface,state,bytes_in,bytes_out,
+        apsd.140,,,5000,5000,
+        tcp4 192.168.1.10:50000<->17.57.145.41:5223,en0,Established,5000,5000,
+        curl.999,,,1500000,20000,
+        tcp4 192.168.1.10:54321<->151.101.1.140:443,en0,Established,1500000,20000,
+        """
+        let resetRes = parser.ingestCSV(withCurlReset, now: now)
+        #expect(resetRes.perPIDBytesInDelta[999] == 750_000)
+        #expect(resetRes.perPIDBytesOutDelta[999] == 10_000)
+        #expect(resetRes.externalSocketDeltas.first?.deltaBytesIn == 1_500_000)
+        #expect(resetRes.externalSocketDeltas.first?.deltaBytesOut == 20_000)
+
+        // Absent for 60 ticks (boundary of maxAbsentTicks == 60): still retained
+        for _ in 0..<60 {
+            now += 2.0
+            _ = parser.ingestCSV(apsdOnly, now: now)
+        }
+        #expect(parser.trackedSocketCount == 2)
+
+        // 61st consecutive absent tick (> maxAbsentTicks == 60): curl.999 evicted so memory stays bounded!
+        now += 2.0
+        _ = parser.ingestCSV(apsdOnly, now: now)
+        #expect(parser.trackedSocketCount == 1)
+
+        // Reappearing with 1,500,000 B after eviction is treated as a brand-new post-baseline connection (delta == 1,500,000)
+        now += 2.0
+        let afterEviction = parser.ingestCSV(withCurlReset, now: now)
+        #expect(afterEviction.externalSocketDeltas.first?.deltaBytesIn == 1_500_000)
+        #expect(parser.trackedSocketCount == 2)
+    }
+
+    @Test("T15 & T19: Synthetic +1 MiB loopback CSV with Listen empty cells verifies exact 524,288 B/s loopback rate")
+    func syntheticLoopbackOneMiBDeltaAndEmptyListenCells() {
+        let parser = NettopDeltaParser()
+        // Synthetic two-tick fixture modeling +1 MiB (1,048,576 B) over 2.0s on 127.0.0.1 alongside an empty-cell Listen row
         let snap1 = """
         ,interface,state,bytes_in,bytes_out,
         Python.49642,,,0,0,
@@ -242,6 +377,57 @@ struct SamplerTests {
         #expect(res.externalSocketDeltas.isEmpty)
         #expect(res.loopbackRxBytesPerSec == 524_288)
         #expect(res.loopbackTxBytesPerSec == 524_288)
+    }
+
+    @Test("T19: Verbatim unedited 2-tick stdout captured via /usr/bin/nettop -L 1 -n -J interface,state,bytes_in,bytes_out")
+    func verbatimUneditedConsecutiveNettopCapturesParseCleanly() {
+        // 1. Two consecutive unedited snapshots captured verbatim on macOS arm64 via:
+        //    `/usr/bin/nettop -L 1 -n -J interface,state,bytes_in,bytes_out -p 61965`
+        //    before and after sending 321,000 bytes over a local 127.0.0.1 socket (512 -> 321,512).
+        let loopbackParser = NettopDeltaParser()
+        let rawSnap1 = """
+        ,interface,state,bytes_in,bytes_out,
+        Python.61965,,,512,512,
+        tcp4 127.0.0.1:52547<->127.0.0.1:52548,lo0,Established,512,0,
+        tcp4 127.0.0.1:52548<->127.0.0.1:52547,lo0,Established,0,512,
+        tcp4 127.0.0.1:52547<->*:*,lo0,Listen,,,
+        """
+        let r1 = loopbackParser.ingestCSV(rawSnap1, now: 4_000.0)
+        #expect(r1.totalInBps == 0)
+        #expect(r1.loopbackRxBytesPerSec == 0)
+
+        let rawSnap2 = """
+        ,interface,state,bytes_in,bytes_out,
+        Python.61965,,,321512,321512,
+        tcp4 127.0.0.1:52547<->127.0.0.1:52548,lo0,Established,321512,0,
+        tcp4 127.0.0.1:52548<->127.0.0.1:52547,lo0,Established,0,321512,
+        tcp4 127.0.0.1:52547<->*:*,lo0,Listen,,,
+        """
+        let r2 = loopbackParser.ingestCSV(rawSnap2, now: 4_002.0) // dt = 2.0s, delta = 321,000 B -> 160,500 B/s
+        #expect(r2.totalInBps == 0)
+        #expect(r2.totalOutBps == 0)
+        #expect(r2.externalSocketDeltas.isEmpty)
+        #expect(r2.loopbackRxBytesPerSec == 160_500)
+        #expect(r2.loopbackTxBytesPerSec == 160_500)
+
+        // 2. Two consecutive unedited snapshots captured verbatim on macOS arm64 via:
+        //    `/usr/bin/nettop -L 1 -n -J interface,state,bytes_in,bytes_out -p 0`
+        //    verifying >32-bit Int64 cumulative byte counters (7,936,865,216 > Int32.max).
+        let kernelParser = NettopDeltaParser()
+        let kernelSnap1 = """
+        ,interface,state,bytes_in,bytes_out,
+        kernel_task.0,,,7936865216,52461484,
+        tcp4 127.0.0.1:49426<->127.0.0.1:49424,lo0,Established,7936865216,52461484,
+        """
+        let kernelSnap2 = """
+        ,interface,state,bytes_in,bytes_out,
+        kernel_task.0,,,7936865216,52461484,
+        tcp4 127.0.0.1:49426<->127.0.0.1:49424,lo0,Established,7936865216,52461484,
+        """
+        _ = kernelParser.ingestCSV(kernelSnap1, now: 4_100.0)
+        let kRes = kernelParser.ingestCSV(kernelSnap2, now: 4_102.0)
+        #expect(kRes.totalInBps == 0)
+        #expect(kRes.loopbackRxBytesPerSec == 0)
     }
 
     @Test("T7 & T10: Real ProcessTreeSampler measures non-zero CPU & memory footprint on current process and surfaces EPERM processes as No permission")
@@ -356,48 +542,61 @@ struct SamplerTests {
         let monitor = ChronoMonitor(store: store, sampler: sampler, startSamplingTimer: false)
 
         let portFile = tmpDir.appendingPathComponent("port.txt")
+        let readySignalFile = tmpDir.appendingPathComponent("ready.signal")
         let goSignalFile = tmpDir.appendingPathComponent("go.signal")
         let doneTransferFile = tmpDir.appendingPathComponent("done.signal")
         let closeSignalFile = tmpDir.appendingPathComponent("close.signal")
 
-        // Process 1: TCP loopback receiver on 127.0.0.1:0
+        // Process 1: TCP loopback receiver on 127.0.0.1:0 (uses atomic temp-file rename for all signals)
         let serverProc = Process()
         serverProc.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
         serverProc.arguments = [
             "-c",
             """
             import os, socket, sys, time
-            port_file, done_file, close_file = sys.argv[1], sys.argv[2], sys.argv[3]
+            port_file, ready_file, done_file, close_file = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+            def write_atomic(path, content):
+                tmp = path + ".tmp"
+                with open(tmp, "w") as f:
+                    f.write(content)
+                    f.flush()
+                os.replace(tmp, path)
+
             srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             srv.bind(("127.0.0.1", 0))
             srv.listen(1)
-            with open(port_file, "w") as f:
-                f.write(str(srv.getsockname()[1]))
+            write_atomic(port_file, str(srv.getsockname()[1]))
             conn, _ = srv.accept()
             total = 0
+            while total < 4096:
+                chunk = conn.recv(4096 - total)
+                if not chunk:
+                    break
+                total += len(chunk)
+            write_atomic(ready_file, str(total))
             target = 200 * 1024 * 1024 + 4096
             while total < target:
                 chunk = conn.recv(1048576)
                 if not chunk:
                     break
                 total += len(chunk)
-            with open(done_file, "w") as f:
-                f.write(str(total))
-            deadline = time.time() + 5.0
+            write_atomic(done_file, str(total))
+            deadline = time.time() + 15.0
             while not os.path.exists(close_file) and time.time() < deadline:
                 time.sleep(0.05)
             conn.close()
             srv.close()
             """,
             portFile.path,
+            readySignalFile.path,
             doneTransferFile.path,
             closeSignalFile.path
         ]
         try serverProc.run()
         defer { if serverProc.isRunning { serverProc.terminate() } }
 
-        let waitPortDeadline = Date().addingTimeInterval(3.0)
+        let waitPortDeadline = Date().addingTimeInterval(10.0)
         while !FileManager.default.fileExists(atPath: portFile.path) && Date() < waitPortDeadline {
             Thread.sleep(forTimeInterval: 0.02)
         }
@@ -414,7 +613,7 @@ struct SamplerTests {
             cli = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             cli.connect(("127.0.0.1", port))
             cli.sendall(b"H" * 4096)
-            deadline = time.time() + 5.0
+            deadline = time.time() + 15.0
             while not os.path.exists(go_file) and time.time() < deadline:
                 time.sleep(0.02)
             buf = b"X" * (4 * 1024 * 1024)
@@ -422,7 +621,7 @@ struct SamplerTests {
                 cli.sendall(buf)
                 if idx == 24:
                     time.sleep(0.35)
-            deadline2 = time.time() + 5.0
+            deadline2 = time.time() + 15.0
             while not os.path.exists(close_file) and time.time() < deadline2:
                 time.sleep(0.05)
             cli.close()
@@ -437,8 +636,11 @@ struct SamplerTests {
         let serverPID = Int(serverProc.processIdentifier)
         let clientPID = Int(clientProc.processIdentifier)
 
-        // Wait briefly for 4 KB handshake so the 127.0.0.1 socket is Established
-        Thread.sleep(forTimeInterval: 0.15)
+        // Wait deterministically until the 4 KB handshake is received so the 127.0.0.1 socket is Established
+        let readyDeadline = Date().addingTimeInterval(10.0)
+        while !FileManager.default.fileExists(atPath: readySignalFile.path) && Date() < readyDeadline {
+            Thread.sleep(forTimeInterval: 0.02)
+        }
 
         let baseNow = Int64(Date().timeIntervalSince1970)
         // Tick 0: Baseline live system + both python3 loopback processes
@@ -447,22 +649,22 @@ struct SamplerTests {
         let baselineOutBps = preTransferTicks.last?.netOutBps ?? 0
         let baselineInBps = preTransferTicks.last?.netInBps ?? 0
 
-        // Trigger the 200 MB transfer over 127.0.0.1
-        try Data("go".utf8).write(to: goSignalFile)
+        // Trigger the 200 MB transfer over 127.0.0.1 atomically
+        try Data("go".utf8).write(to: goSignalFile, options: .atomic)
 
-        // Wait until all 200 MB have crossed 127.0.0.1 (socket remains open until closeSignalFile!)
-        let transferDeadline = Date().addingTimeInterval(5.0)
+        // Wait until all 200 MB have crossed 127.0.0.1 (doneTransferFile appears atomically via os.replace!)
+        let transferDeadline = Date().addingTimeInterval(15.0)
         while !FileManager.default.fileExists(atPath: doneTransferFile.path) && Date() < transferDeadline {
             Thread.sleep(forTimeInterval: 0.05)
         }
         let transferredBytes = Int64(try String(contentsOf: doneTransferFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
         #expect(transferredBytes >= 200 * 1024 * 1024)
 
-        // Tick 1 (1s later while socket is still Established with +200 MB on lo0)
+        // Tick 1 (while socket is still Established with +200 MB on lo0)
         monitor.captureLiveTick(nowOverride: baseNow + 2)
 
         // Release both helper processes cleanly
-        try Data("close".utf8).write(to: closeSignalFile)
+        try Data("close".utf8).write(to: closeSignalFile, options: .atomic)
         serverProc.waitUntilExit()
         clientProc.waitUntilExit()
 

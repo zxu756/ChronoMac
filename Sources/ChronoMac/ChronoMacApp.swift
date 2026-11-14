@@ -45,7 +45,11 @@ struct ChronoMacApp: App {
         }
 
         let isDemoMode = args.contains("--demo")
-        _localizer = StateObject(wrappedValue: AppLocalizer.shared)
+        let appLocalizer = AppLocalizer.configureShared(
+            arguments: args,
+            preferenceStore: UserDefaultsPreferenceStore(.standard)
+        )
+        _localizer = StateObject(wrappedValue: appLocalizer)
         if isDemoMode {
             _monitor = StateObject(wrappedValue: ChronoMonitor.preview())
         } else {
