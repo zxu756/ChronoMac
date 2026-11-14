@@ -75,7 +75,7 @@ private final class StubSystemSampler: SystemSamplerProtocol, @unchecked Sendabl
 
 @Suite("Sampler Tests", .timeLimit(.minutes(1)))
 struct SamplerTests {
-    @Test("T3: Real nettop CSV with 200 MB loopback transfer separates loopback counter, excludes it from external rates, and triggers 0 anomalies")
+    @Test("T3: Synthetic nettop CSV with 200 MB loopback transfer separates loopback counter, excludes it from external rates, and triggers 0 anomalies")
     func loopbackTrafficExcludedFromExternalRatesAndAnomalies() {
         let parser = NettopDeltaParser()
         let tick1 = """
@@ -126,17 +126,20 @@ struct SamplerTests {
         #expect(anomalies.isEmpty)
     }
 
-    @Test("T3: Newly observed PID uses first-seen cumulative bytes as baseline and accumulates subsequent deltas")
-    func newProcessFirstSightingUsesCumulativeBytesAsBaseline() {
+    @Test("T3 & T13: Post-baseline newly appearing PID attributes first-seen socket bytes and accumulates subsequent deltas")
+    func postBaselineNewProcessFirstSightingAndSubsequentDelta() {
         let parser = NettopDeltaParser()
         let tick0 = """
         ,interface,state,bytes_in,bytes_out,
         apsd.140,,,5000,5000,
         tcp4 192.168.1.10:50000<->17.57.145.41:5223,en0,Established,5000,5000,
         """
-        _ = parser.ingestCSV(tick0, now: 2_000.0)
+        let baseline = parser.ingestCSV(tick0, now: 2_000.0)
+        // Global Tick 1 establishes baseline without attributing pre-existing socket history
+        #expect(baseline.totalInBps == 0)
+        #expect(baseline.externalSocketDeltas.isEmpty)
 
-        // PID 55555 appears for the first time at t=2002 with 50 MB cumulative bytes
+        // PID 55555 appears AFTER global baseline at t=2002 (dt=2s) with 50,000,000 B inbound / 100,000 B outbound
         let tick1 = """
         ,interface,state,bytes_in,bytes_out,
         apsd.140,,,5000,5000,
@@ -145,8 +148,11 @@ struct SamplerTests {
         tcp4 192.168.1.10:50123<->104.16.132.229:443,en0,Established,50000000,100000,
         """
         let firstSight = parser.ingestCSV(tick1, now: 2_002.0)
-        #expect((firstSight.perPIDBytesInDelta[55555] ?? 0) == 0)
-        #expect(firstSight.externalSocketDeltas.isEmpty)
+        #expect(firstSight.perPIDBytesInDelta[55555] == 25_000_000)
+        #expect(firstSight.perPIDBytesOutDelta[55555] == 50_000)
+        #expect(firstSight.externalSocketDeltas.count == 1)
+        #expect(firstSight.externalSocketDeltas.first?.deltaBytesIn == 50_000_000)
+        #expect(firstSight.externalSocketDeltas.first?.deltaBytesOut == 100_000)
 
         // Next tick (t=2004, dt=2s): PID 55555 downloads +8,000,000 bytes -> 4,000,000 B/s
         let tick2 = """
@@ -161,6 +167,81 @@ struct SamplerTests {
         #expect(secondSight.perPIDBytesOutDelta[55555] == 10_000)
         #expect(secondSight.externalSocketDeltas.count == 1)
         #expect(secondSight.externalSocketDeltas.first?.deltaBytesIn == 8_000_000)
+    }
+
+    @Test("T13: Two-tick CSV where curl.999 newly appears on Tick 2 with 40 MB attributes 40 MB to curl.999 instead of dropping to 0")
+    func postBaselineNewProcessTrafficAttributedNotDropped() {
+        let fortyMB: Int64 = 40_000_000
+
+        // Uncollapsed nettop -L 1 CSV (with socket rows, including quic/tcp)
+        let parser = NettopDeltaParser()
+        let tick1 = """
+        ,interface,state,bytes_in,bytes_out,
+        apsd.140,,,12000,8000,
+        tcp4 192.168.1.10:50000<->17.57.145.41:5223,en0,Established,12000,8000,
+        """
+        let base = parser.ingestCSV(tick1, now: 5_000.0)
+        #expect(base.totalInBps == 0)
+
+        let tick2 = """
+        ,interface,state,bytes_in,bytes_out,
+        apsd.140,,,12000,8000,
+        tcp4 192.168.1.10:50000<->17.57.145.41:5223,en0,Established,12000,8000,
+        curl.999,,,\(fortyMB),64000,
+        tcp4 192.168.1.10:54321<->151.101.1.140:443,en0,Established,\(fortyMB),64000,
+        """
+        let res = parser.ingestCSV(tick2, now: 5_002.0) // dt = 2.0s
+        #expect(res.perPIDBytesInDelta[999] == fortyMB / 2)
+        #expect(res.perPIDBytesOutDelta[999] == 32_000)
+        #expect(res.totalInBps == fortyMB / 2)
+        #expect(res.externalSocketDeltas.count == 1)
+        #expect(res.externalSocketDeltas.first?.pid == 999)
+        #expect(res.externalSocketDeltas.first?.processName == "curl")
+        #expect(res.externalSocketDeltas.first?.deltaBytesIn == fortyMB)
+
+        // Collapsed nettop -P -L 1 CSV (process summary rows only, no socket child rows)
+        let collapsedParser = NettopDeltaParser()
+        let pTick1 = """
+        ,bytes_in,bytes_out,
+        apsd.140,12000,8000,
+        """
+        _ = collapsedParser.ingestCSV(pTick1, now: 6_000.0)
+        let pTick2 = """
+        ,bytes_in,bytes_out,
+        apsd.140,12000,8000,
+        curl.999,\(fortyMB),64000,
+        """
+        let pRes = collapsedParser.ingestCSV(pTick2, now: 6_002.0) // dt = 2.0s
+        #expect(pRes.perPIDBytesInDelta[999] == fortyMB / 2)
+        #expect(pRes.totalInBps == fortyMB / 2)
+    }
+
+    @Test("T15: Verbatim captured /usr/bin/nettop -L 1 CSV with Listen empty cells and loopback sockets parses cleanly")
+    func capturedMacOSNettopLoopbackCSVParsesCleanly() {
+        let parser = NettopDeltaParser()
+        // Verbatim output captured from `/usr/bin/nettop -L 1 -n -J interface,state,bytes_in,bytes_out` on macOS arm64
+        let snap1 = """
+        ,interface,state,bytes_in,bytes_out,
+        Python.49642,,,0,0,
+        tcp4 127.0.0.1:63002<->127.0.0.1:63003,lo0,Established,0,0,
+        tcp4 127.0.0.1:63003<->127.0.0.1:63002,lo0,Established,0,0,
+        tcp4 127.0.0.1:63002<->*:*,lo0,Listen,,,
+        """
+        _ = parser.ingestCSV(snap1, now: 3_000.0)
+
+        let snap2 = """
+        ,interface,state,bytes_in,bytes_out,
+        Python.49642,,,1048576,1048576,
+        tcp4 127.0.0.1:63002<->127.0.0.1:63003,lo0,Established,1048576,0,
+        tcp4 127.0.0.1:63003<->127.0.0.1:63002,lo0,Established,0,1048576,
+        tcp4 127.0.0.1:63002<->*:*,lo0,Listen,,,
+        """
+        let res = parser.ingestCSV(snap2, now: 3_002.0)
+        #expect(res.totalInBps == 0)
+        #expect(res.totalOutBps == 0)
+        #expect(res.externalSocketDeltas.isEmpty)
+        #expect(res.loopbackRxBytesPerSec == 524_288)
+        #expect(res.loopbackTxBytesPerSec == 524_288)
     }
 
     @Test("T7 & T10: Real ProcessTreeSampler measures non-zero CPU & memory footprint on current process and surfaces EPERM processes as No permission")

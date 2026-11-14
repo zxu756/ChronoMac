@@ -2,25 +2,25 @@
 
 **English** | **[简体中文](README.zh-CN.md)**
 
-**macOS User-Space System Flight Recorder (Records While Open), 5-Track DVR Timeline & External Socket Ledger (`v0.2.0`)**
+**macOS User-Space System Flight Recorder (Records While Open), 5-Track DVR Timeline & External Socket Ledger**
 
 `Activity Monitor` and `btop` only show *right now*—if your Mac thermal-throttles during a build, balloons into multi-gigabyte VM swap, or uploads hundreds of megabytes while ChronoMac is open and the culprit child process exits minutes later, live monitors have already forgotten what happened.
 
-**ChronoMac `v0.2.0`** records host telemetry, top process blame snapshots, external TCP/UDP socket byte deltas, and local AI coding agent session spans (`Claude Code`, `Codex CLI`, `OpenCode`) every 2 seconds **while the ChronoMac app/menu bar is open**, storing history in a bounded SQLite WAL flightbox (`<= 250 MB` including `-wal`/`-shm`) in **100% non-root user space**—with zero kernel extensions (`KEXT`) or paid `NetworkExtension` entitlements, plus live in-app **`中文 / EN`** bilingual switching (`⇧⌘L`).
+**ChronoMac** (`v0.2.0` latest release; M0 hardening below marked **Unreleased (after `v0.2.0`)**) records host telemetry, top process blame snapshots, external TCP/UDP/QUIC socket byte deltas, and local AI coding agent session spans (`Claude Code`, `Codex CLI`, `OpenCode`) every 2 seconds **while the ChronoMac app/menu bar is open**, storing history in a bounded SQLite WAL flightbox (`<= 250 MB` including `-wal`/`-shm`) in **100% non-root user space**—with zero kernel extensions (`KEXT`) or paid `NetworkExtension` entitlements, plus live in-app **`中文 / EN`** bilingual switching (`⇧⌘L`).
 
 ![ChronoMac DVR Timeline & Process Socket Forensics (DEMO)](docs/screenshot-main.png)
-> **`[DEMO]` Synthetic Preview Data**: The screenshot above is rendered from deterministic synthetic data (`ChronoMac --demo` / `ChronoMonitor.preview()`) illustrating a simulated swap & outbound network incident.
+> **`[DEMO]` Synthetic Preview Data**: The screenshot above is rendered from deterministic synthetic data (`ChronoMac --demo` — *Unreleased (after `v0.2.0`)* / `ChronoMonitor.preview()`) illustrating a simulated swap & outbound network incident.
 
 ---
 
-## Verified Capabilities (`v0.2.0` / M0)
+## Verified Capabilities (`v0.2.0` + Unreleased M0 Hardening)
 
 - **Synchronized 5-Track DVR Oscilloscope (`TimelineScrubberCanvas`)** — Scrub across **1h / 6h / 24h / 7d** windows of recorded history to correlate SoC CPU & thermal state, host memory + VM swap, disk R/W throughput, external network throughput, and AI coding agent session windows.
-- **Post-Mortem Process Blame with Delta & Liveness** — Time-travel to any recorded timestamp or anomaly bookmark. ChronoMac reports the exact time offset from your requested timestamp (`Snapshot at <ts> (<Y>s from requested time)`), whether each process is **`still running`** or **`exited after spike`**, and lets you rank explicitly **By CPU**, **By Memory**, or **By Network** (`--sort cpu|memory|network`).
-- **Honest `Memory Footprint (phys_footprint)` & Permission Boundaries** — Reports Mach `ri_phys_footprint` (matching macOS Activity Monitor's *Memory* metric rather than BSD `RSS`). System/root processes enumerable via `sysctl(KERN_PROC_ALL)` whose `proc_pid_rusage` counters are restricted in non-root user space (e.g., `WindowServer`, `launchd`, `kernel_task`) remain visible and display **`No permission`** instead of fake `0.0%` readings.
-- **External Socket Ledger with Loopback Isolation** — Computes per-process external socket deltas from non-root `nettop` snapshots with asynchronous local PTR reverse-DNS resolution. Loopback traffic (`127.0.0.0/8`, `::1`, `lo0`) is tracked in its own dedicated counter, excluded from external inbound/outbound totals, and never triggers outbound anomaly alerts. Newly observed PIDs are baselined on first sight, and unresolved executable paths remain blank rather than copying short `comm` names.
-- **Peak-Preserving 3-Tier Compaction & Hard Storage Ceiling** — Keeps raw `2s` ticks for 2 hours, compacts completed buckets into monotonic peak-preserving `15s` (2h–24h) and `60s` (24h–7d) rollups (`ON CONFLICT DO UPDATE SET ... MAX(...)`), checkpoints WAL (`PRAGMA wal_checkpoint(TRUNCATE)`), and enforces a strict on-disk cap (`sqlite + wal + shm <= maxDatabaseBytes`, default `250 MB`) with page reclamation.
-- **Calibrated Human-Readable CLI (`--cli`) & Read-Only MCP Server (`--mcp`)** — `ChronoMac --cli status` samples Mach CPU load ticks twice `1.0s` apart for calibrated CPU% readings; `status`, `blame`, `anomalies`, and `egress` emit clean human-readable output in English or Simplified Chinese (`--lang en|zh`) or structured JSON (`--json`), opening SQLite strictly read-only (`--db <path>` or `CHRONOMAC_DB_PATH`).
+- **Post-Mortem Process Blame with Delta & Liveness** *(Unreleased after `v0.2.0`)* — Time-travel to any recorded timestamp or anomaly bookmark. ChronoMac reports the exact time offset from your requested timestamp (`Snapshot at <ts> (<Y>s from requested time)`), whether each process is **`still running`** or **`exited after spike`**, and lets you rank explicitly **By CPU**, **By Memory**, or **By Network** (`--sort cpu|memory|network`).
+- **Honest `Memory Footprint (phys_footprint)` & Permission Boundaries** *(Unreleased after `v0.2.0`)* — Reports Mach `ri_phys_footprint` (matching macOS Activity Monitor's *Memory* metric rather than BSD `RSS`). System/root processes enumerable via `sysctl(KERN_PROC_ALL)` whose `proc_pid_rusage` counters are restricted in non-root user space (e.g., `WindowServer`, `launchd`, `kernel_task`) remain visible and display **`No permission`** instead of fake `0.0%` readings.
+- **External Socket Ledger with Loopback Isolation** *(Loopback isolation & post-baseline first-sight attribution: Unreleased after `v0.2.0`)* — Computes per-process external socket deltas from non-root `nettop` snapshots with asynchronous local PTR reverse-DNS resolution. Loopback traffic (`127.0.0.0/8`, `::1`, `lo0`) is tracked in its own dedicated counter, excluded from external inbound/outbound totals, and never triggers outbound anomaly alerts. Tick 1 establishes the global baseline of pre-existing open sockets; on subsequent ticks, newly appearing processes/sockets carry post-baseline bytes (`nettop` enumerates live kernel sockets via `NStatManager`) and are attributed on first sight rather than dropped to `0`. Unresolved executable paths remain blank rather than copying short `comm` names.
+- **Peak-Preserving 3-Tier Compaction & Hard Storage Ceiling** *(Bucket alignment & WAL-inclusive cap: Unreleased after `v0.2.0`)* — Keeps raw `2s` ticks for 2 hours, compacts completed buckets into monotonic peak-preserving `15s` (2h–24h) and `60s` (24h–7d) rollups (`ON CONFLICT DO UPDATE SET ... MAX(...)`), checkpoints WAL (`PRAGMA wal_checkpoint(TRUNCATE)`), and enforces a strict on-disk cap (`sqlite + wal + shm <= maxDatabaseBytes`, default `250 MB`) with page reclamation.
+- **Calibrated Human-Readable CLI (`--cli`) & Read-Only MCP Server (`--mcp`)** *(Calibrated `1.0s` `status`, human-readable tables, `--json`, `--db`, exit code `2`: Unreleased after `v0.2.0`)* — `ChronoMac --cli status` samples Mach CPU load ticks twice `1.0s` apart for calibrated CPU% readings; `status`, `blame`, `anomalies`, and `egress` emit clean human-readable output in English or Simplified Chinese (`--lang en|zh`) or structured JSON (`--json`), opening SQLite strictly read-only (`--db <path>` or `CHRONOMAC_DB_PATH`).
 - **Live `中文 / EN` Bilingual UI** — Auto-detects Chinese macOS locale on first launch and switches instantaneously via the `中文 | EN` pill, `⇧⌘L`, or `--lang zh|en`.
 
 <p align="center">
@@ -32,7 +32,7 @@
 
 ## Recording Scope & Roadmap
 
-- **Current (`v0.2.0` / M0)**: Telemetry is sampled and persisted every 2 seconds **while the ChronoMac GUI / menu bar app is running**. `--cli` and `--mcp` are strictly read-only query interfaces and do not run a background collector.
+- **Current (`v0.2.0` + Unreleased M0)**: Telemetry is sampled and persisted every 2 seconds **while the ChronoMac GUI / menu bar app is running**. `--cli` and `--mcp` are strictly read-only query interfaces and do not run a background collector.
 - **Planned (M1)**: Headless background recording daemon (`chronomac record`) + optional `LaunchAgent` plist (`~/Library/LaunchAgents/io.github.zxu756.chronomac.plist`) for continuous 7-day unattended recording when the GUI window is quit, validated against `powermetrics` / `vm_stat` / `netstat -ib`.
 - **Planned (M2)**: Richer attribution & correlation workflows on top of the verified background flightbox.
 
@@ -59,6 +59,8 @@ xattr -cr /Applications/ChronoMac.app
 
 ### Build & Test from Source
 
+> Note: `./Scripts/test.sh` is **Unreleased (after `v0.2.0`)** on source builds.
+
 ```bash
 git clone https://github.com/zxu756/ChronoMac.git
 cd ChronoMac
@@ -71,6 +73,8 @@ cd ChronoMac
 ## CLI & MCP Server Usage
 
 ### Headless CLI (`--cli`)
+
+> **Release note (`v0.2.0` vs Unreleased)**: `v0.2.0` introduced `--cli` (`status`, `blame --at`, `anomalies`, `egress`), `--mcp`, and `--lang en|zh`. Read-only SQLite isolation (`--db <path>`, `CHRONOMAC_DB_PATH`), `1.0s` calibrated `status`, human-readable table formatting, `--json`, `--sort cpu|memory|network`, `--minutes <N>`, `--hours <N>`, `--help`, and exit code `2` on invalid flags/subcommands are **Unreleased (after `v0.2.0`)**.
 
 All `--cli` commands open the SQLite database **read-only** (`--db <path>` or `CHRONOMAC_DB_PATH`, defaulting to `~/Library/Application Support/ChronoMac/flightbox.sqlite`). Unknown flags or subcommands print an error to `stderr` and exit with code `2`.
 

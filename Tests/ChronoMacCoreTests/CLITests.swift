@@ -234,4 +234,44 @@ struct CLITests {
         #expect(!missingBlame.stderr.isEmpty)
         #expect(!FileManager.default.fileExists(atPath: missingDBPath))
     }
+
+    @Test("W3 Helper: Captures real live host telemetry via ChronoMonitor and FlightboxStore when CHRONOMAC_SEED_LIVE_DB is set")
+    @MainActor
+    func captureRealLiveFlightboxWhenRequested() throws {
+        guard let liveDBPath = ProcessInfo.processInfo.environment["CHRONOMAC_SEED_LIVE_DB"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !liveDBPath.isEmpty else {
+            return
+        }
+
+        let dbURL = URL(fileURLWithPath: liveDBPath)
+        try? FileManager.default.removeItem(at: dbURL)
+        try? FileManager.default.removeItem(atPath: liveDBPath + "-wal")
+        try? FileManager.default.removeItem(atPath: liveDBPath + "-shm")
+
+        let store = try FlightboxStore(databaseURL: dbURL)
+        let liveSampler = LiveSystemSampler()
+        let monitor = ChronoMonitor(store: store, sampler: liveSampler, startSamplingTimer: false)
+
+        // Spawn a real short-lived local CPU worker so the live snapshot captures both a real process that
+        // exits right after the spike and live processes that remain running.
+        let worker = Process()
+        worker.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        worker.arguments = ["-c", "import time\nt = time.time() + 0.65\nx = 1\nwhile time.time() < t:\n    x = (x * 1664525 + 1013904223) & 0xFFFFFFFF\n"]
+        try worker.run()
+
+        // Warm baseline counters while worker is alive, wait 0.40s, then record calibrated live tick via ChronoMonitor + FlightboxStore
+        let warmNow = Date().timeIntervalSince1970
+        _ = liveSampler.sampleHostState()
+        _ = liveSampler.sampleNetwork(now: warmNow)
+        _ = liveSampler.sampleProcesses(ts: Int64(warmNow), netInBpsByPID: [:], netOutBpsByPID: [:], limit: 60)
+        Thread.sleep(forTimeInterval: 0.40)
+
+        monitor.captureLiveTick()
+        worker.waitUntilExit()
+
+        let now = Int64(Date().timeIntervalSince1970)
+        let ticks = store.queryTicks(from: now - 60, to: now + 5)
+        #expect(!ticks.isEmpty)
+    }
 }

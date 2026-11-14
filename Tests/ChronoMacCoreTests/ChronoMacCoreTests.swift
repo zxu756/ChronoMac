@@ -20,31 +20,23 @@ struct ChronoMacCoreTests {
     @Test("NettopDeltaParser computes per-PID and external socket deltas while filtering loopback")
     func nettopDeltaParsing() {
         let parser = NettopDeltaParser()
-        let csvTick1 = """
-        time,,bytes_in,bytes_out,state,
-        12:00:00,claude.49201,10000,20000,,
-        12:00:00,tcp4 192.168.1.15:54321<->160.79.104.10:443,10000,20000,Established,
-        12:00:00,tcp4 127.0.0.1:51234<->127.0.0.1:11434,999999,999999,Established,
-        """
-        // Wait — check real nettop format: first col is `claude.49201`, second col is `state`!
-        let realTick1 = """
+        let syntheticTick1 = """
         time,state,bytes_in,bytes_out,
         claude.49201,,10000,20000,
         tcp4 192.168.1.15:54321<->160.79.104.10:443,Established,10000,20000,
         tcp4 127.0.0.1:51234<->127.0.0.1:11434,Established,500000,500000,
         """
-        _ = csvTick1
-        let base = parser.ingestCSV(realTick1, now: 1_000.0)
+        let base = parser.ingestCSV(syntheticTick1, now: 1_000.0)
         #expect(base.totalInBps == 0)
         #expect(base.externalSocketDeltas.isEmpty)
 
-        let realTick2 = """
+        let syntheticTick2 = """
         time,state,bytes_in,bytes_out,
         claude.49201,,30000,80000,
         tcp4 192.168.1.15:54321<->160.79.104.10:443,Established,30000,80000,
         tcp4 127.0.0.1:51234<->127.0.0.1:11434,Established,900000,900000,
         """
-        let second = parser.ingestCSV(realTick2, now: 1_002.0)
+        let second = parser.ingestCSV(syntheticTick2, now: 1_002.0)
         // dt = 2.0s: dIn = 20_000 -> 10_000 B/s; dOut = 60_000 -> 30_000 B/s
         #expect(second.perPIDBytesInDelta[49201] == 10_000)
         #expect(second.perPIDBytesOutDelta[49201] == 30_000)
@@ -219,18 +211,16 @@ struct ChronoMacCoreTests {
         #expect(menuZhData.count > 15_000)
     }
 
-    @Test("AppLocalizer resolves --lang CLI, UserDefaults, and Chinese system locale with live toggle")
+    @Test("AppLocalizer resolves --lang CLI, PreferenceStore, and Chinese system locale with live toggle")
     @MainActor
     func localizationResolutionAndToggle() throws {
-        let suiteName = "io.github.zxu756.ChronoMac.tests.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
-        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let prefs = InMemoryPreferenceStore()
         let key = "io.github.zxu756.ChronoMac.language"
 
-        // 1. Auto-detects Chinese from Locale.preferredLanguages when UserDefaults & CLI are unset
+        // 1. Auto-detects Chinese from Locale.preferredLanguages when PreferenceStore & CLI are unset
         let zhAuto = AppLocalizer(
             arguments: ["ChronoMac"],
-            userDefaults: defaults,
+            preferenceStore: prefs,
             preferredLanguages: ["zh-Hans-CN", "en-US"],
             defaultsKey: key
         )
@@ -241,7 +231,7 @@ struct ChronoMacCoreTests {
         // 2. Falls back to English on non-Chinese system locale
         let enAuto = AppLocalizer(
             arguments: ["ChronoMac"],
-            userDefaults: defaults,
+            preferenceStore: prefs,
             preferredLanguages: ["en-US"],
             defaultsKey: key
         )
@@ -249,29 +239,29 @@ struct ChronoMacCoreTests {
         #expect(enAuto.language.badge == "EN")
         #expect(enAuto.L("Live", "实时") == "Live")
 
-        // 3. Toggle persists to UserDefaults and flips zh-Hans <-> en
+        // 3. Toggle persists to PreferenceStore and flips zh-Hans <-> en
         enAuto.toggle()
         #expect(enAuto.language == .zhHans)
-        #expect(defaults.string(forKey: key) == "zh-Hans")
+        #expect(prefs.string(forKey: key) == "zh-Hans")
 
         enAuto.toggle()
         #expect(enAuto.language == .en)
-        #expect(defaults.string(forKey: key) == "en")
+        #expect(prefs.string(forKey: key) == "en")
 
-        // 4. UserDefaults overrides system locale
-        defaults.set("zh-Hans", forKey: key)
+        // 4. PreferenceStore overrides system locale
+        prefs.set("zh-Hans", forKey: key)
         let fromDefaults = AppLocalizer(
             arguments: ["ChronoMac"],
-            userDefaults: defaults,
+            preferenceStore: prefs,
             preferredLanguages: ["en-US"],
             defaultsKey: key
         )
         #expect(fromDefaults.language == .zhHans)
 
-        // 5. CLI --lang flag overrides both UserDefaults and system locale
+        // 5. CLI --lang flag overrides both PreferenceStore and system locale
         let cliOverrideEN = AppLocalizer(
             arguments: ["ChronoMac", "--lang", "en"],
-            userDefaults: defaults,
+            preferenceStore: prefs,
             preferredLanguages: ["zh-Hans-CN"],
             defaultsKey: key
         )
@@ -279,7 +269,7 @@ struct ChronoMacCoreTests {
 
         let cliOverrideZH = AppLocalizer(
             arguments: ["ChronoMac", "--export-screenshots", "/tmp", "--lang=zh"],
-            userDefaults: defaults,
+            preferenceStore: prefs,
             preferredLanguages: ["en-US"],
             defaultsKey: key
         )

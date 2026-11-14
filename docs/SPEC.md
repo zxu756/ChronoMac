@@ -21,9 +21,9 @@
    - Permission boundary: When `proc_pid_rusage` fails with `EPERM` (or PID `0` `kernel_task`), `isCPUReadable` is `false` (stored as `-1.0` sentinel in `process_snapshots.cpu_pct`) and rendered as `No permission` / `无权限`.
    - Rankings: Separate deterministic sort modes — `By CPU` (`cpu`), `By Memory` (`memory`), and `By Network` (`network`).
 3. **Network & Loopback Isolation (`NettopDeltaParser`)**:
-   - Invokes `/usr/bin/nettop -P -L 1 -n -x -J interface,state,bytes_in,bytes_out`? Note: socket rows require uncollapsed mode (`-L 1 -n -J interface,state,bytes_in,bytes_out`).
+   - Invokes `/usr/bin/nettop -L 1 -n -J interface,state,bytes_in,bytes_out` (uncollapsed socket mode, supporting `tcp4`, `tcp6`, `udp4`, `udp6`, `quic4`, `quic6` child rows as well as collapsed `-P` process-summary CSVs).
    - Loopback sockets (`interface == lo0`, `127.0.0.0/8`, `::1`, `fe80::1%lo0`) are accumulated exclusively into `loopbackRxBytesPerSec` / `loopbackTxBytesPerSec` (`system_ticks.loopback_in_bps` / `loopback_out_bps`) and excluded from external `net_in_bps`, `net_out_bps`, `socket_ledger`, and `AnomalyDetector`.
-   - First-seen PIDs and sockets establish a baseline (`delta = 0` on first observation); subsequent ticks accumulate byte deltas.
+   - Tick 1 establishes the global baseline of all pre-existing open sockets (`delta = 0` on global baseline tick). Because `nettop` enumerates live kernel sockets via `NStatManager` (closed pre-baseline sockets carry `0` bytes into subsequent snapshots), processes and sockets newly appearing on Tick 2+ carry post-baseline bytes and are attributed on first sight rather than dropped to `0`. Residual limitations (ultra-short sockets opening and closing completely between two `2s` polls, or an unconnected UDP socket bound before Tick 1 that calls `connect()` after Tick 1) are scheduled for M1 interface differential calibration (`netstat -ib`).
 4. **Local AI Agent Correlation (`AgentActivityBridge`)**:
    - Reads only file mtimes in `~/.claude/projects/<slug>/*.jsonl`, read-only `session.title` (<= 22 chars) + timestamps in `~/.local/share/opencode/opencode.db`, and read-only `threads.cwd` (basename) + timestamps in `~/.codex/state_5.sqlite`. Prompt/message bodies are never read.
 

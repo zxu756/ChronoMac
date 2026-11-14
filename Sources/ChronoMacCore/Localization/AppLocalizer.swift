@@ -52,6 +52,38 @@ public enum AppLanguage: String, CaseIterable, Identifiable, Codable, Sendable {
     }
 }
 
+public protocol PreferenceStore: AnyObject {
+    func string(forKey defaultName: String) -> String?
+    func set(_ value: Any?, forKey defaultName: String)
+}
+
+extension UserDefaults: PreferenceStore {}
+
+public final class InMemoryPreferenceStore: PreferenceStore, @unchecked Sendable {
+    private var storage: [String: String]
+    private let lock = NSLock()
+
+    public init(initial: [String: String] = [:]) {
+        self.storage = initial
+    }
+
+    public func string(forKey defaultName: String) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage[defaultName]
+    }
+
+    public func set(_ value: Any?, forKey defaultName: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        if let str = value as? String {
+            storage[defaultName] = str
+        } else if value == nil {
+            storage.removeValue(forKey: defaultName)
+        }
+    }
+}
+
 @MainActor
 public final class AppLocalizer: ObservableObject {
     public nonisolated static let bundleLanguageKey = "io.github.zxu756.ChronoMac.language"
@@ -59,31 +91,24 @@ public final class AppLocalizer: ObservableObject {
 
     @Published public private(set) var language: AppLanguage
 
-    private let userDefaults: UserDefaults?
+    private let preferenceStore: (any PreferenceStore)?
     private let defaultsKey: String
 
-    public nonisolated static func defaultUserDefaults(
-        environment: [String: String] = ProcessInfo.processInfo.environment
-    ) -> UserDefaults {
-        if let suite = environment["CHRONOMAC_PREFS_SUITE"]?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !suite.isEmpty,
-           let isolated = UserDefaults(suiteName: suite) {
-            return isolated
-        }
-        return .standard
+    public nonisolated static func defaultPreferenceStore() -> (any PreferenceStore)? {
+        Bundle.main.bundlePath.hasSuffix(".app") ? UserDefaults.standard : nil
     }
 
     public init(
         arguments: [String] = CommandLine.arguments,
-        userDefaults: UserDefaults = AppLocalizer.defaultUserDefaults(),
+        preferenceStore: (any PreferenceStore)? = AppLocalizer.defaultPreferenceStore(),
         preferredLanguages: [String] = Locale.preferredLanguages,
         defaultsKey: String = AppLocalizer.bundleLanguageKey
     ) {
-        self.userDefaults = userDefaults
+        self.preferenceStore = preferenceStore
         self.defaultsKey = defaultsKey
         self.language = Self.resolveLanguage(
             arguments: arguments,
-            userDefaults: userDefaults,
+            preferenceStore: preferenceStore,
             preferredLanguages: preferredLanguages,
             defaultsKey: defaultsKey
         )
@@ -91,24 +116,24 @@ public final class AppLocalizer: ObservableObject {
 
     public init(
         language: AppLanguage,
-        userDefaults: UserDefaults? = nil,
+        preferenceStore: (any PreferenceStore)? = nil,
         defaultsKey: String = AppLocalizer.bundleLanguageKey
     ) {
-        self.userDefaults = userDefaults
+        self.preferenceStore = preferenceStore
         self.defaultsKey = defaultsKey
         self.language = language
     }
 
     public nonisolated static func resolveLanguage(
         arguments: [String] = CommandLine.arguments,
-        userDefaults: UserDefaults = AppLocalizer.defaultUserDefaults(),
+        preferenceStore: (any PreferenceStore)? = nil,
         preferredLanguages: [String] = Locale.preferredLanguages,
         defaultsKey: String = AppLocalizer.bundleLanguageKey
     ) -> AppLanguage {
         if let cliLang = AppLanguage.parseCLIArguments(arguments) {
             return cliLang
         }
-        if let stored = userDefaults.string(forKey: defaultsKey),
+        if let stored = preferenceStore?.string(forKey: defaultsKey),
            let parsed = AppLanguage.parse(stored) {
             return parsed
         }
@@ -129,7 +154,7 @@ public final class AppLocalizer: ObservableObject {
 
     public func setLanguage(_ newLanguage: AppLanguage) {
         language = newLanguage
-        userDefaults?.set(newLanguage.rawValue, forKey: defaultsKey)
+        preferenceStore?.set(newLanguage.rawValue, forKey: defaultsKey)
     }
 
     public func toggle() {

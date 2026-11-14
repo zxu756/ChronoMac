@@ -107,22 +107,34 @@ struct StoreTests {
         let startTs: Int64 = 1_800_000_000
         let totalSeconds: Int64 = 30 * 3600 // 30 hours = 108,000s
         var spikeTimestamps: [Int64] = []
+        var lateBufferedFlushesByMinute: [Int: Int64] = [:]
         for idx in 0..<90 {
-            // Deliberately vary spike position across start/middle/end of 15s & 60s buckets
-            let offset = Int64((idx * 7) % 58)
-            let evenOffset = (offset / 2) * 2
-            spikeTimestamps.append(startTs + Int64(idx) * 1200 + evenOffset)
+            let bucket20m = startTs + Int64(idx) * 1200
+            let evenOffset: Int64
+            if idx % 3 == 0 {
+                // Bucket-base spike (B + 0) plus a delayed idle sample arriving right after 2h Tier-1 compaction
+                evenOffset = 0
+                let flushMinute = (idx * 20) + 121
+                if flushMinute < Int(totalSeconds / 60) {
+                    lateBufferedFlushesByMinute[flushMinute] = bucket20m + 12
+                }
+            } else {
+                // First-half mid-bucket spike in [B+16, B+22] (< B+23 half-bucket cutoff for both 15s and 60s buckets)
+                evenOffset = 16 + Int64((idx % 4) * 2)
+            }
+            spikeTimestamps.append(bucket20m + evenOffset)
         }
-        let spikeSet = Set(spikeTimestamps)
-        #expect(spikeSet.count == 90)
+        let spikeIndexByTs = Dictionary(uniqueKeysWithValues: spikeTimestamps.enumerated().map { ($1, $0) })
+        #expect(spikeIndexByTs.count == 90)
 
-        // Advance in 60-second increments (1,800 compaction runs), using unaligned cutoff (+7s)
+        // Advance in 60-second increments (1,800 compaction runs), triggering compaction at half-bucket offset (+23s: 23%15==8, 23%60==23)
         for minute in 0..<(Int(totalSeconds / 60)) {
             let winStart = startTs + Int64(minute * 60)
             let winEnd = winStart + 60
             var ts = winStart
             while ts < winEnd {
-                let isSpike = spikeSet.contains(ts)
+                let spikeIdx = spikeIndexByTs[ts]
+                let isSpike = (spikeIdx != nil)
                 let tick = SystemTick(
                     ts: ts,
                     tier: .raw2s,
@@ -137,19 +149,76 @@ struct StoreTests {
                     netInBps: 0,
                     netOutBps: 0
                 )
-                try store.recordSampleBatch(tick: tick, processes: [], sockets: [], anomalies: [])
+                let procs: [ProcessSample]
+                if let idx = spikeIdx {
+                    procs = [
+                        ProcessSample(
+                            ts: ts,
+                            pid: 9000 + idx,
+                            ppid: 1,
+                            name: "spike-culprit-\(idx)",
+                            execPath: "/usr/local/bin/spike-culprit",
+                            cpuPct: 260.0,
+                            rssBytes: 2_000_000_000
+                        )
+                    ]
+                } else if (ts - winStart) < 30 && (minute % 20 == 0) {
+                    procs = [
+                        ProcessSample(
+                            ts: ts,
+                            pid: 100,
+                            ppid: 1,
+                            name: "idle-daemon",
+                            execPath: "/usr/libexec/idle-daemon",
+                            cpuPct: 2.0,
+                            rssBytes: 40_000_000
+                        )
+                    ]
+                } else {
+                    procs = []
+                }
+                try store.recordSampleBatch(tick: tick, processes: procs, sockets: [], anomalies: [])
                 ts += 2
             }
-            // Trigger compaction every 60s with a sliding unaligned timestamp (+7s)
-            try store.runRollupAndRetention(now: winEnd + 7)
+
+            if let delayedIdleTs = lateBufferedFlushesByMinute[minute] {
+                let lateTick = SystemTick(
+                    ts: delayedIdleTs,
+                    tier: .raw2s,
+                    cpuUserPct: 12.0,
+                    cpuSysPct: 3.0,
+                    thermalGrade: .nominal,
+                    memUsedBytes: 8_000_000_000,
+                    memTotalBytes: 24_000_000_000,
+                    swapUsedBytes: 0,
+                    diskReadBps: 0,
+                    diskWriteBps: 0,
+                    netInBps: 0,
+                    netOutBps: 0
+                )
+                let lateIdleProc = ProcessSample(
+                    ts: delayedIdleTs,
+                    pid: 101,
+                    ppid: 1,
+                    name: "late-idle-flush",
+                    execPath: "/usr/libexec/idle-daemon",
+                    cpuPct: 1.5,
+                    rssBytes: 32_000_000
+                )
+                try store.recordSampleBatch(tick: lateTick, processes: [lateIdleProc], sockets: [], anomalies: [])
+            }
+
+            // Trigger compaction every 60s right in the middle of both 15s (23 % 15 == 8) and 60s (23 % 60 == 23) buckets
+            try store.runRollupAndRetention(now: winEnd + 23)
         }
 
-        let finalNow = startTs + totalSeconds + 7
+        let finalNow = startTs + totalSeconds + 23
         try store.runRollupAndRetention(now: finalNow)
 
         let allTicks = store.queryTicks(from: startTs - 60, to: finalNow)
         var survivingSpikes = 0
-        for spikeTs in spikeTimestamps {
+        var survivingCulprits = 0
+        for (idx, spikeTs) in spikeTimestamps.enumerated() {
             let bucket60Start = (spikeTs / 60) * 60
             let hasPeak = allTicks.contains { t in
                 t.ts >= bucket60Start && t.ts < bucket60Start + 60 && t.totalCPUPct >= 90.0
@@ -157,8 +226,13 @@ struct StoreTests {
             if hasPeak {
                 survivingSpikes += 1
             }
+            let (_, blamed) = store.queryNearestProcesses(at: spikeTs, livePIDs: [1])
+            if blamed.contains(where: { $0.name == "spike-culprit-\(idx)" }) {
+                survivingCulprits += 1
+            }
         }
         #expect(survivingSpikes == 90)
+        #expect(survivingCulprits == 90)
     }
 
     @Test("T2 Acceptance Row 2: 2 MB storage cap trims 10 MB of <48h data including WAL and reclaims free pages")

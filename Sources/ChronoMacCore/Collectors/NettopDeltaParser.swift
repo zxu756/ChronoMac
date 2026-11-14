@@ -92,9 +92,10 @@ public final class NettopDeltaParser: @unchecked Sendable {
         }
     }
 
-    /// Ingests `nettop -L 1 -n -J interface,state,bytes_in,bytes_out` (or legacy 4-col `time,state,bytes_in,bytes_out`) CSV output,
-    /// separating `lo0` / `127.0.0.0/8` / `::1` loopback traffic into dedicated loopback counters so loopback never inflates external rates,
-    /// and baselining newly observed processes on first sight.
+    /// Ingests `nettop -L 1 -n -J interface,state,bytes_in,bytes_out` (or legacy/collapsed CSV) output,
+    /// separating `lo0` / `127.0.0.0/8` / `::1` loopback traffic into dedicated loopback counters so loopback never inflates external rates.
+    /// Tick 1 establishes the global baseline of pre-existing open sockets; on subsequent ticks, newly appearing processes/sockets
+    /// carry post-baseline bytes (`nettop` enumerates live kernel sockets via `NStatManager`) and are attributed on first sight.
     public func ingestCSV(_ csv: String, now: TimeInterval) -> NettopSnapshotResult {
         lock.lock()
         defer { lock.unlock() }
@@ -109,16 +110,17 @@ public final class NettopDeltaParser: @unchecked Sendable {
         var headerParsed = false
 
         var curProcCounters: [String: CounterPair] = [:]
+        var curProcPIDs: [String: Int] = [:]
         var curSockCounters: [String: CounterPair] = [:]
         var perPIDExtInBytes: [Int: Int64] = [:]
         var perPIDExtOutBytes: [Int: Int64] = [:]
         var perPIDLoopInBytes: [Int: Int64] = [:]
         var perPIDLoopOutBytes: [Int: Int64] = [:]
         var sockDeltas: [NettopSocketDelta] = []
+        var sawAnySocketRow = false
 
         var currentPID: Int?
         var currentProcName: String = ""
-        var currentPIDWasPreviouslyBaselined = false
 
         let lines = csv.split(whereSeparator: \.isNewline)
         for rawLine in lines {
@@ -142,8 +144,9 @@ public final class NettopDeltaParser: @unchecked Sendable {
             let requiredMaxIdx = max(bytesInColIdx, bytesOutColIdx)
             guard cols.count > requiredMaxIdx else { continue }
 
-            // Socket row starts with tcp4 / tcp6 / udp4 / udp6 and contains "<->"
-            if (first.hasPrefix("tcp") || first.hasPrefix("udp")), first.contains("<->") {
+            // Socket row starts with tcp* / udp* / quic* and contains "<->"
+            if (first.hasPrefix("tcp") || first.hasPrefix("udp") || first.hasPrefix("quic")), first.contains("<->") {
+                sawAnySocketRow = true
                 guard let pid = currentPID else { continue }
                 let bytesIn = Int64(cols[bytesInColIdx]) ?? 0
                 let bytesOut = Int64(cols[bytesOutColIdx]) ?? 0
@@ -153,8 +156,8 @@ public final class NettopDeltaParser: @unchecked Sendable {
                 let sockKey = "\(pid)|\(first)"
                 curSockCounters[sockKey] = CounterPair(bytesIn: bytesIn, bytesOut: bytesOut)
 
-                // Only emit deltas when the owning process was ALREADY baselined on an earlier tick.
-                if !isFirstBaseline && currentPIDWasPreviouslyBaselined {
+                // After Tick 1 establishes the global baseline, any newly appearing socket carries post-baseline traffic.
+                if !isFirstBaseline {
                     let prev = prevSocketCounters[sockKey] ?? CounterPair(bytesIn: 0, bytesOut: 0)
                     let dIn = bytesIn >= prev.bytesIn ? bytesIn - prev.bytesIn : bytesIn
                     let dOut = bytesOut >= prev.bytesOut ? bytesOut - prev.bytesOut : bytesOut
@@ -190,8 +193,20 @@ public final class NettopDeltaParser: @unchecked Sendable {
 
                 currentPID = pid
                 currentProcName = name
-                currentPIDWasPreviouslyBaselined = (!isFirstBaseline && prevProcessCounters[procKey] != nil)
                 curProcCounters[procKey] = CounterPair(bytesIn: bytesIn, bytesOut: bytesOut)
+                curProcPIDs[procKey] = pid
+            }
+        }
+
+        // Fallback for collapsed `nettop -P` CSVs that contain only process summary rows and no socket child rows.
+        if !sawAnySocketRow && !isFirstBaseline {
+            for (procKey, cur) in curProcCounters {
+                guard let pid = curProcPIDs[procKey] else { continue }
+                let prev = prevProcessCounters[procKey] ?? CounterPair(bytesIn: 0, bytesOut: 0)
+                let dIn = cur.bytesIn >= prev.bytesIn ? cur.bytesIn - prev.bytesIn : cur.bytesIn
+                let dOut = cur.bytesOut >= prev.bytesOut ? cur.bytesOut - prev.bytesOut : cur.bytesOut
+                if dIn > 0 { perPIDExtInBytes[pid, default: 0] += dIn }
+                if dOut > 0 { perPIDExtOutBytes[pid, default: 0] += dOut }
             }
         }
 

@@ -12,7 +12,6 @@ trap cleanup EXIT
 
 export CHRONOMAC_DB_PATH="$TMP_ACC/default-isolated.sqlite"
 export CHRONOMAC_AGENT_HOME="$TMP_ACC/empty-agent-home"
-export CHRONOMAC_PREFS_SUITE="io.github.zxu756.ChronoMac.m0acc.$$"
 mkdir -p "$CHRONOMAC_AGENT_HOME"
 
 REAL_USER_DB="$HOME/Library/Application Support/ChronoMac/flightbox.sqlite"
@@ -27,24 +26,38 @@ if [[ ! -x "$BIN" ]]; then
 fi
 
 echo "========================================================================"
-echo "ChronoMac M0 Acceptance Suite (Isolated Temp Dir: $TMP_ACC)"
+echo "ChronoMac M0 Acceptance Suite (Isolated Temp Dir)"
 echo "========================================================================"
 
 # ------------------------------------------------------------------------
 # Row 1: 30h synthetic stream, 1 spike every 20m (90 total), compact every 60s
 # ------------------------------------------------------------------------
 echo ""
-echo "[Row 1/6] 30-hour synthetic stream (90 spikes every 20m, compaction every 60s)..."
+echo "[Row 1/6] 30-hour synthetic stream (90 spikes every 20m, half-bucket compaction every 60s)..."
 ROW1_DB="$TMP_ACC/row1.sqlite"
+set +e
 CHRONOMAC_ROW1_EXPORT_DB="$ROW1_DB" swift test --no-parallel --filter "ChronoMacCoreTests.StoreTests/thirtyHourSlidingCompactionPreservesAll90Spikes"
-SPIKE_COUNT="$(/usr/bin/sqlite3 "$ROW1_DB" "SELECT COUNT(*) FROM system_ticks WHERE (cpu_user + cpu_sys) >= 90.0;")"
-TOTAL_ROWS_R1="$(/usr/bin/sqlite3 "$ROW1_DB" "SELECT COUNT(*) FROM system_ticks;")"
-echo "  -> SQLite verification: surviving_spikes=$SPIKE_COUNT / 90 across $TOTAL_ROWS_R1 compacted/raw rows"
-if [[ "$SPIKE_COUNT" -ne 90 ]]; then
-    echo "FAIL [Row 1]: Expected 90 surviving spikes, got $SPIKE_COUNT" >&2
+R1_TEST_RC=$?
+set -e
+
+if [[ -f "$ROW1_DB" ]]; then
+    RAW_PEAK_TICKS="$(/usr/bin/sqlite3 "$ROW1_DB" "SELECT COUNT(*) FROM system_ticks WHERE (cpu_user + cpu_sys) >= 90.0;")"
+    SPIKE_COUNT="$(/usr/bin/sqlite3 "$ROW1_DB" "SELECT COUNT(*) FROM system_ticks t WHERE (t.cpu_user + t.cpu_sys) >= 90.0 AND EXISTS (SELECT 1 FROM process_snapshots p WHERE (p.ts / 60) = (t.ts / 60) AND p.name LIKE 'spike-culprit-%');")"
+    SPLIT_BUCKETS="$(/usr/bin/sqlite3 "$ROW1_DB" "SELECT COUNT(*) FROM (SELECT (ts / 15) * 15 AS b FROM system_ticks GROUP BY b HAVING COUNT(DISTINCT tier) > 1);")"
+    TOTAL_ROWS_R1="$(/usr/bin/sqlite3 "$ROW1_DB" "SELECT COUNT(*) FROM system_ticks;")"
+else
+    RAW_PEAK_TICKS=0
+    SPIKE_COUNT=0
+    SPLIT_BUCKETS=0
+    TOTAL_ROWS_R1=0
+fi
+
+echo "  -> SQLite verification: surviving_spikes=$SPIKE_COUNT / 90 (tick_peaks=$RAW_PEAK_TICKS, split_buckets=$SPLIT_BUCKETS, total_rows=$TOTAL_ROWS_R1)"
+if [[ "$R1_TEST_RC" -ne 0 || "$SPIKE_COUNT" -ne 90 || "$RAW_PEAK_TICKS" -ne 90 || "$SPLIT_BUCKETS" -ne 0 ]]; then
+    echo "FAIL [Row 1]: Expected surviving_spikes=90 / 90 and split_buckets=0 (got surviving_spikes=$SPIKE_COUNT, tick_peaks=$RAW_PEAK_TICKS, split_buckets=$SPLIT_BUCKETS, test_rc=$R1_TEST_RC)" >&2
     exit 1
 fi
-echo "  -> PASS [Row 1]: 90 / 90 spikes preserved."
+echo "  -> PASS [Row 1]: 90 / 90 spikes and culprit snapshots preserved across half-bucket boundaries."
 
 # ------------------------------------------------------------------------
 # Row 2: 2 MB cap, 10 MB of <48h data inserted, run retention -> db + wal <= 2 MB
@@ -76,17 +89,30 @@ echo ""
 echo "[Row 3/6] Live recording session with 200 MB TCP 127.0.0.1 loopback transfer..."
 ROW3_DB="$TMP_ACC/row3.sqlite"
 CHRONOMAC_ROW3_EXPORT_DB="$ROW3_DB" swift test --no-parallel --filter "ChronoMacCoreTests.SamplerTests/liveTwoHundredMBLoopbackTransferBetweenTwoProcesses"
-LOOP_PEAK="$(/usr/bin/sqlite3 "$ROW3_DB" "SELECT MAX(loopback_out_bps) FROM system_ticks;")"
-EXT_DIFF="$(/usr/bin/sqlite3 "$ROW3_DB" "SELECT MAX(net_out_bps) - MIN(net_out_bps) FROM system_ticks;")"
+LOOP_IN_PEAK="$(/usr/bin/sqlite3 "$ROW3_DB" "SELECT COALESCE(MAX(loopback_in_bps), 0) FROM system_ticks;")"
+LOOP_OUT_PEAK="$(/usr/bin/sqlite3 "$ROW3_DB" "SELECT COALESCE(MAX(loopback_out_bps), 0) FROM system_ticks;")"
+EXT_IN_DIFF="$(/usr/bin/sqlite3 "$ROW3_DB" "SELECT COALESCE(MAX(net_in_bps) - MIN(net_in_bps), 0) FROM system_ticks;")"
+EXT_OUT_DIFF="$(/usr/bin/sqlite3 "$ROW3_DB" "SELECT COALESCE(MAX(net_out_bps) - MIN(net_out_bps), 0) FROM system_ticks;")"
+EXT_TOTAL_IMPLIED_BYTES="$(/usr/bin/sqlite3 "$ROW3_DB" "SELECT COALESCE(SUM((net_in_bps + net_out_bps) * 2), 0) FROM system_ticks;")"
 LOOP_SOCKETS="$(/usr/bin/sqlite3 "$ROW3_DB" "SELECT COUNT(*) FROM socket_ledger WHERE remote_endpoint LIKE '127.%' OR remote_endpoint LIKE '::1.%' OR remote_endpoint LIKE '::1:%' OR process_name LIKE '%python%';")"
 ANOM_COUNT="$(/usr/bin/sqlite3 "$ROW3_DB" "SELECT COUNT(*) FROM anomaly_bookmarks WHERE culprit_name LIKE '%python%' OR summary LIKE '%127.0.0.1%';")"
 ANOM_EN="$("$BIN" --cli anomalies --db "$ROW3_DB" --lang en)"
 ANOM_ZH="$("$BIN" --cli anomalies --db "$ROW3_DB" --lang zh)"
 EGRESS_EN="$("$BIN" --cli egress --db "$ROW3_DB" --lang en)"
 EGRESS_ZH="$("$BIN" --cli egress --db "$ROW3_DB" --lang zh)"
-echo "  -> SQLite verification: peak_loopback_out_bps=$LOOP_PEAK ext_out_delta_bps=$EXT_DIFF loopback_rows_in_socket_ledger=$LOOP_SOCKETS net_anomalies=$ANOM_COUNT"
+echo "  -> SQLite verification: peak_loopback_in_bps=$LOOP_IN_PEAK peak_loopback_out_bps=$LOOP_OUT_PEAK ext_in_delta_bps=$EXT_IN_DIFF ext_out_delta_bps=$EXT_OUT_DIFF ext_total_implied_bytes=$EXT_TOTAL_IMPLIED_BYTES loopback_rows_in_socket_ledger=$LOOP_SOCKETS net_anomalies=$ANOM_COUNT"
 echo "  -> CLI anomalies (EN): $(echo "$ANOM_EN" | tail -n 1)"
 echo "  -> CLI anomalies (ZH): $(echo "$ANOM_ZH" | tail -n 1)"
+FIFTY_MIB=$((50 * 1024 * 1024))
+TWENTY_MB=20000000
+if [[ "$LOOP_IN_PEAK" -lt "$FIFTY_MIB" || "$LOOP_OUT_PEAK" -lt "$FIFTY_MIB" ]]; then
+    echo "FAIL [Row 3]: Loopback peak rate too low (in=$LOOP_IN_PEAK, out=$LOOP_OUT_PEAK; expected >= $FIFTY_MIB B/s)" >&2
+    exit 1
+fi
+if [[ "$EXT_IN_DIFF" -ge "$TWENTY_MB" || "$EXT_OUT_DIFF" -ge "$TWENTY_MB" || "$EXT_TOTAL_IMPLIED_BYTES" -ge 50000000 ]]; then
+    echo "FAIL [Row 3]: External network counters surged during 200 MB loopback transfer (ext_in_delta_bps=$EXT_IN_DIFF, ext_out_delta_bps=$EXT_OUT_DIFF, ext_total_implied_bytes=$EXT_TOTAL_IMPLIED_BYTES)" >&2
+    exit 1
+fi
 if [[ "$LOOP_SOCKETS" -ne 0 || "$ANOM_COUNT" -ne 0 ]]; then
     echo "FAIL [Row 3]: Loopback leaked into external socket ledger or anomalies!" >&2
     exit 1
@@ -97,7 +123,7 @@ if echo "$EGRESS_EN $EGRESS_ZH" | grep -q "127.0.0.1"; then
         exit 1
     fi
 fi
-echo "  -> PASS [Row 3]: External inbound/outbound untouched by 200 MB loopback; 0 network anomalies."
+echo "  -> PASS [Row 3]: External inbound/outbound did not jump by 200 MB (ext_in_delta_bps=$EXT_IN_DIFF, ext_out_delta_bps=$EXT_OUT_DIFF); 0 network anomalies."
 
 # ------------------------------------------------------------------------
 # Row 4: `ChronoMac --cli status` 5 consecutive runs alongside `top` (EN & ZH)
@@ -175,14 +201,128 @@ done
 echo "  -> PASS [Row 5]: Exit code 2 verified in both EN and ZH."
 
 # ------------------------------------------------------------------------
-# Row 6: Mutation-sensitive CPU / Memory / Cap unit test guards
+# Row 6: Real Isolated Fault-Injection Mutation Harness (W1)
 # ------------------------------------------------------------------------
 echo ""
-echo "[Row 6/6] Running mutation-sensitive CPU, Memory Footprint, and Storage Cap test guards..."
-swift test --no-parallel \
-    --filter "ChronoMacCoreTests.SamplerTests/realProcessTreeSamplerMeasuresCurrentProcessAndSurfacesUnreadableSystemPIDs" \
-    --filter "ChronoMacCoreTests.StoreTests/enforcesTwoMegabyteCapWithinFortyEightHoursIncludingWAL"
-echo "  -> PASS [Row 6]: Guard tests active and passing (3 live RED->GREEN mutations verified)."
+echo "[Row 6/6] Running real fault-injection mutations in isolated temp workspace..."
+MUT_REPO="$TMP_ACC/mut-repo"
+mkdir -p "$MUT_REPO"
+/usr/bin/rsync -a --exclude='.build' --exclude='build' --exclude='.git' "$ROOT/" "$MUT_REPO/"
+git -C "$MUT_REPO" init -q
+git -C "$MUT_REPO" add -A
+git -C "$MUT_REPO" -c user.name="mut" -c user.email="mut@local" commit -qm "baseline"
+
+# Initial test build in isolated workspace
+(cd "$MUT_REPO" && swift build --build-tests >/dev/null 2>&1)
+
+run_mutation_check() {
+    local mut_id="$1"
+    local file_rel="$2"
+    local filter_expr="$3"
+    local py_patch="$4"
+
+    /usr/bin/python3 - "$MUT_REPO/$file_rel" "$py_patch" <<'PY'
+import sys
+path, mode = sys.argv[1], sys.argv[2]
+text = open(path, encoding="utf-8").read()
+if mode == "cpu_zero":
+    old = "cpuPct = (deltaSec / dt) * 100.0"
+    new = "cpuPct = 0.0"
+elif mode == "mem_zero":
+    old = "footprintBytes = Int64(ru.ri_phys_footprint > 0 ? ru.ri_phys_footprint : ru.ri_resident_size)"
+    new = "footprintBytes = 0"
+elif mode == "cap_off":
+    old = "while totalStorageBytes() > maxDatabaseBytes && guardIterations < 40 {"
+    new = "while false && totalStorageBytes() > maxDatabaseBytes && guardIterations < 40 {"
+elif mode == "cutoff_unaligned":
+    old = "let alignedCutoff = (cutoff / bucketSec) * bucketSec"
+    new = "let alignedCutoff = cutoff"
+elif mode == "conflict_replace":
+    old = "INSERT INTO system_ticks ("
+    new = "INSERT OR REPLACE INTO system_ticks ("
+    if old not in text:
+        sys.exit(3)
+    text = text.replace(old, new, 1)
+    start_idx = text.index("ON CONFLICT(ts) DO UPDATE SET")
+    end_idx = text.index("END;", start_idx) + len("END;")
+    text = text[:start_idx] + ";" + text[end_idx:]
+    open(path, "w", encoding="utf-8").write(text)
+    sys.exit(0)
+elif mode == "nettop_drop_new_pid":
+    old = "if !isFirstBaseline {"
+    new = "if !isFirstBaseline && prevSocketCounters[sockKey] != nil {"
+else:
+    sys.exit(2)
+
+if old not in text:
+    sys.exit(3)
+open(path, "w", encoding="utf-8").write(text.replace(old, new, 1))
+PY
+
+    # 1. Must compile cleanly (NOT a compile failure!)
+    if ! (cd "$MUT_REPO" && swift build --build-tests >/dev/null 2>&1); then
+        echo "FAIL [Row 6 - $mut_id]: Mutation caused a compile error instead of a test assertion failure!" >&2
+        exit 1
+    fi
+
+    # 2. Target test must run and fail with an explicit test failure marker
+    set +e
+    MUT_OUT="$(cd "$MUT_REPO" && CHRONOMAC_DB_PATH="$TMP_ACC/mut-${mut_id}.sqlite" swift test --skip-build --no-parallel --filter "$filter_expr" 2>&1)"
+    MUT_RC=$?
+    set -e
+
+    git -C "$MUT_REPO" checkout -q -- .
+    if [[ -n "$(git -C "$MUT_REPO" status --porcelain)" ]]; then
+        echo "FAIL [Row 6 - $mut_id]: Temp workspace dirty after checkout!" >&2
+        exit 1
+    fi
+
+    if [[ "$MUT_RC" -eq 0 ]]; then
+        echo "FAIL [Row 6 - $mut_id]: Mutated code unexpectedly PASSED ($filter_expr)!" >&2
+        exit 1
+    fi
+    if ! echo "$MUT_OUT" | grep -q '✘ Test "'; then
+        echo "FAIL [Row 6 - $mut_id]: Non-zero exit ($MUT_RC) without specific Swift Testing case failure marker!" >&2
+        echo "$MUT_OUT" >&2
+        exit 1
+    fi
+    local failed_line
+    failed_line="$(echo "$MUT_OUT" | grep '✘ Test "' | tail -n 1 | sed 's/^[[:space:]]*//')"
+    echo "  -> Mutation [$mut_id] caught cleanly (compile=0, test_rc=$MUT_RC): $failed_line"
+}
+
+run_mutation_check "cpu_zero" \
+    "Sources/ChronoMacCore/Collectors/ProcessTreeSampler.swift" \
+    "ChronoMacCoreTests.SamplerTests/realProcessTreeSamplerMeasuresCurrentProcessAndSurfacesUnreadableSystemPIDs" \
+    "cpu_zero"
+
+run_mutation_check "mem_zero" \
+    "Sources/ChronoMacCore/Collectors/ProcessTreeSampler.swift" \
+    "ChronoMacCoreTests.SamplerTests/realProcessTreeSamplerMeasuresCurrentProcessAndSurfacesUnreadableSystemPIDs" \
+    "mem_zero"
+
+run_mutation_check "cap_off" \
+    "Sources/ChronoMacCore/Storage/FlightboxStore.swift" \
+    "ChronoMacCoreTests.StoreTests/enforcesTwoMegabyteCapWithinFortyEightHoursIncludingWAL" \
+    "cap_off"
+
+run_mutation_check "cutoff_unaligned" \
+    "Sources/ChronoMacCore/Storage/FlightboxStore.swift" \
+    "ChronoMacCoreTests.StoreTests/thirtyHourSlidingCompactionPreservesAll90Spikes" \
+    "cutoff_unaligned"
+
+run_mutation_check "conflict_replace" \
+    "Sources/ChronoMacCore/Storage/FlightboxStore.swift" \
+    "ChronoMacCoreTests.StoreTests/thirtyHourSlidingCompactionPreservesAll90Spikes" \
+    "conflict_replace"
+
+run_mutation_check "nettop_drop_new_pid" \
+    "Sources/ChronoMacCore/Collectors/NettopDeltaParser.swift" \
+    "ChronoMacCoreTests.SamplerTests/postBaselineNewProcessTrafficAttributedNotDropped" \
+    "nettop_drop_new_pid"
+
+rm -rf "$MUT_REPO"
+echo "  -> PASS [Row 6]: All 6 isolated code mutations compiled cleanly and failed their specific guard tests."
 
 # ------------------------------------------------------------------------
 # Final Safety Verification: User's real flightbox.sqlite untouched
@@ -194,7 +334,7 @@ if [[ -n "$BEFORE_REAL_SHA" ]]; then
         exit 1
     fi
     echo ""
-    echo "[DB Safety] Verified ~/Library/Application Support/ChronoMac/flightbox.sqlite untouched (SHA-256: $AFTER_REAL_SHA)."
+    echo "[DB Safety] Verified user flightbox.sqlite untouched (SHA-256: $AFTER_REAL_SHA)."
 fi
 
 echo ""

@@ -293,31 +293,11 @@ public final class FlightboxStore: @unchecked Sendable {
 
     private func insertTick(_ t: SystemTick, db: OpaquePointer) throws {
         let sql = """
-        INSERT INTO system_ticks (
+        INSERT OR REPLACE INTO system_ticks (
             ts, tier, cpu_user, cpu_sys, thermal_level, mem_used_bytes, mem_total_bytes,
             swap_used_bytes, disk_read_bps, disk_write_bps, net_in_bps, net_out_bps,
             loopback_in_bps, loopback_out_bps, active_agent_count, active_agent_summary
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(ts) DO UPDATE SET
-            tier = MAX(system_ticks.tier, excluded.tier),
-            cpu_user = MAX(system_ticks.cpu_user, excluded.cpu_user),
-            cpu_sys = MAX(system_ticks.cpu_sys, excluded.cpu_sys),
-            thermal_level = MAX(system_ticks.thermal_level, excluded.thermal_level),
-            mem_used_bytes = MAX(system_ticks.mem_used_bytes, excluded.mem_used_bytes),
-            mem_total_bytes = MAX(system_ticks.mem_total_bytes, excluded.mem_total_bytes),
-            swap_used_bytes = MAX(system_ticks.swap_used_bytes, excluded.swap_used_bytes),
-            disk_read_bps = MAX(system_ticks.disk_read_bps, excluded.disk_read_bps),
-            disk_write_bps = MAX(system_ticks.disk_write_bps, excluded.disk_write_bps),
-            net_in_bps = MAX(system_ticks.net_in_bps, excluded.net_in_bps),
-            net_out_bps = MAX(system_ticks.net_out_bps, excluded.net_out_bps),
-            loopback_in_bps = MAX(system_ticks.loopback_in_bps, excluded.loopback_in_bps),
-            loopback_out_bps = MAX(system_ticks.loopback_out_bps, excluded.loopback_out_bps),
-            active_agent_count = MAX(system_ticks.active_agent_count, excluded.active_agent_count),
-            active_agent_summary = CASE
-                WHEN LENGTH(excluded.active_agent_summary) >= LENGTH(system_ticks.active_agent_summary)
-                THEN excluded.active_agent_summary
-                ELSE system_ticks.active_agent_summary
-            END;
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let s = stmt else { return }
@@ -569,12 +549,13 @@ public final class FlightboxStore: @unchecked Sendable {
             "SELECT MIN(ts) FROM system_ticks WHERE tier = \(fromTier) AND ts < \(alignedCutoff);"
         )
         let alignedStart = (minCandidateTs / bucketSec) * bucketSec
+        let peakSpan: Int64 = (fromTier == 0) ? 1 : 15
 
         let sql = """
         DELETE FROM process_snapshots
         WHERE ts >= \(alignedStart) AND ts < \(alignedCutoff)
-          AND ts NOT IN (
-              SELECT peak_ts FROM (
+          AND NOT EXISTS (
+              SELECT 1 FROM (
                   SELECT ts AS peak_ts,
                          ROW_NUMBER() OVER (
                              PARTITION BY (ts / \(bucketSec)) * \(bucketSec)
@@ -582,7 +563,10 @@ public final class FlightboxStore: @unchecked Sendable {
                          ) AS rn
                   FROM system_ticks
                   WHERE ts >= \(alignedStart) AND ts < \(alignedCutoff)
-              ) WHERE rn = 1
+              ) peaks
+              WHERE peaks.rn = 1
+                AND process_snapshots.ts >= peaks.peak_ts
+                AND process_snapshots.ts < peaks.peak_ts + \(peakSpan)
           );
 
         INSERT INTO system_ticks (

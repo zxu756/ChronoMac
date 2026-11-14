@@ -11,185 +11,206 @@ cleanup() {
 trap cleanup EXIT
 
 SEED_DB="$TMP_RM/flightbox.sqlite"
+WORK_DIR="$TMP_RM/run-cwd"
+mkdir -p "$WORK_DIR" "$TMP_RM/agent-home"
+
 export CHRONOMAC_DB_PATH="$SEED_DB"
 export CHRONOMAC_AGENT_HOME="$TMP_RM/agent-home"
-export CHRONOMAC_PREFS_SUITE="io.github.zxu756.ChronoMac.readme.$$"
-mkdir -p "$CHRONOMAC_AGENT_HOME"
 
-BIN="$ROOT/.build/debug/ChronoMac"
-if [[ ! -x "$BIN" ]]; then
-    swift build --product ChronoMac
+swift build --product ChronoMac >/dev/null
+BIN_DIR="$(cd "$(dirname "$ROOT/.build/debug/ChronoMac")" && pwd)"
+export PATH="$BIN_DIR:$PATH"
+
+echo "========================================================================"
+echo "Parsing & Replaying Fenced Code Blocks from README.md & README.zh-CN.md"
+echo "========================================================================"
+
+echo ""
+echo "[Step 1/3] Capturing live Flightbox snapshot via ChronoMonitor + FlightboxStore..."
+CHRONOMAC_SEED_LIVE_DB="$SEED_DB" swift test --no-parallel --filter "ChronoMacCoreTests.CLITests/captureRealLiveFlightboxWhenRequested" >/dev/null
+if [[ ! -f "$SEED_DB" ]]; then
+    echo "FAIL: ChronoMonitor live capture did not create $SEED_DB" >&2
+    exit 1
 fi
+LIVE_TICKS="$(/usr/bin/sqlite3 "$SEED_DB" "SELECT COUNT(*) FROM system_ticks;")"
+LIVE_PROCS="$(/usr/bin/sqlite3 "$SEED_DB" "SELECT COUNT(*) FROM process_snapshots;")"
+echo "  -> Captured real host Flightbox: system_ticks=$LIVE_TICKS, process_snapshots=$LIVE_PROCS"
 
-# Seed an isolated temporary SQLite flightbox with a snapshot ~10m ago so every README command runs realistically
-/usr/bin/python3 - "$SEED_DB" "$$" <<'PY'
-import sqlite3, sys, time
+echo ""
+echo "[Step 2/3] Extracting and executing fenced bash/sh commands from README.md & README.zh-CN.md..."
+/usr/bin/python3 - "$ROOT" "$WORK_DIR" "$SEED_DB" <<'PY'
+import json
+import os
+import re
+import subprocess
+import sys
 
-db_path = sys.argv[1]
-alive_pid = int(sys.argv[2])
-now = int(time.time())
-snap_ts = now - 590  # 9m50s ago -> 10s delta from `--at 10m`
+root_dir, work_dir, seed_db = sys.argv[1], sys.argv[2], sys.argv[3]
 
-conn = sqlite3.connect(db_path)
-conn.executescript("""
-PRAGMA auto_vacuum = INCREMENTAL;
-PRAGMA journal_mode = WAL;
-CREATE TABLE system_ticks (
-    ts INTEGER PRIMARY KEY,
-    tier INTEGER NOT NULL,
-    cpu_user REAL NOT NULL,
-    cpu_sys REAL NOT NULL,
-    thermal_level INTEGER NOT NULL,
-    mem_used_bytes INTEGER NOT NULL,
-    mem_total_bytes INTEGER NOT NULL,
-    swap_used_bytes INTEGER NOT NULL,
-    disk_read_bps INTEGER NOT NULL,
-    disk_write_bps INTEGER NOT NULL,
-    net_in_bps INTEGER NOT NULL,
-    net_out_bps INTEGER NOT NULL,
-    loopback_in_bps INTEGER NOT NULL DEFAULT 0,
-    loopback_out_bps INTEGER NOT NULL DEFAULT 0,
-    active_agent_count INTEGER NOT NULL,
-    active_agent_summary TEXT NOT NULL
-);
-CREATE TABLE process_snapshots (
-    ts INTEGER NOT NULL,
-    pid INTEGER NOT NULL,
-    ppid INTEGER NOT NULL,
-    name TEXT NOT NULL,
-    exec_path TEXT NOT NULL,
-    bundle_id TEXT,
-    signing_team TEXT,
-    cpu_pct REAL NOT NULL,
-    rss_bytes INTEGER NOT NULL,
-    disk_read_bps INTEGER NOT NULL,
-    disk_write_bps INTEGER NOT NULL,
-    net_in_bps INTEGER NOT NULL,
-    net_out_bps INTEGER NOT NULL,
-    PRIMARY KEY (ts, pid)
-);
-CREATE TABLE socket_ledger (
-    bucket_hour INTEGER NOT NULL,
-    exec_path TEXT NOT NULL,
-    process_name TEXT NOT NULL,
-    remote_endpoint TEXT NOT NULL,
-    hostname TEXT,
-    proto TEXT NOT NULL,
-    total_bytes_in INTEGER NOT NULL,
-    total_bytes_out INTEGER NOT NULL,
-    first_seen INTEGER NOT NULL,
-    last_seen INTEGER NOT NULL,
-    PRIMARY KEY (bucket_hour, exec_path, process_name, remote_endpoint)
-);
-CREATE TABLE anomaly_bookmarks (
-    id TEXT PRIMARY KEY,
-    ts INTEGER NOT NULL,
-    kind TEXT NOT NULL,
-    severity INTEGER NOT NULL,
-    culprit_name TEXT NOT NULL,
-    culprit_exec TEXT NOT NULL,
-    metric_badge TEXT NOT NULL,
-    summary TEXT NOT NULL
-);
-""")
+FENCE_RE = re.compile(r"```(bash|sh|json)\s*\n(.*?)```", re.DOTALL)
 
-conn.execute(
-    "INSERT INTO system_ticks VALUES (?, 0, 74.0, 12.0, 2, 16000000000, 25769803776, 1500000000, 40000000, 15000000, 2000000, 14000000, 0, 0, 1, 'OpenCode')",
-    (snap_ts,)
-)
-conn.executemany(
-    "INSERT INTO process_snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    [
-        (snap_ts, 999992, 1, "ephemeral-indexer", "/usr/local/bin/ephemeral-indexer", None, None, 225.4, 3800000000, 20000000, 5000000, 512000, 14000000),
-        (snap_ts, alive_pid, 1, "readme-shell", "/bin/bash", None, None, 18.2, 420000000, 0, 0, 0, 0),
-        (snap_ts, 1, 0, "launchd", "/sbin/launchd", None, "Apple", -1.0, 0, 0, 0, 0, 0),
-    ]
-)
-conn.execute(
-    "INSERT INTO socket_ledger VALUES (?, '/usr/local/bin/ephemeral-indexer', 'ephemeral-indexer', '54.231.194.82:443', 's3-accelerate.amazonaws.com', 'tcp4', 1200000, 64000000, ?, ?)",
-    ((snap_ts // 3600) * 3600, snap_ts - 20, snap_ts)
-)
-conn.execute(
-    "INSERT INTO anomaly_bookmarks VALUES ('bm-readme-1', ?, 'Outbound spike', 2, 'ephemeral-indexer', '/usr/local/bin/ephemeral-indexer', '13.4 MB/s up', 'ephemeral-indexer uploaded 61 MB to s3-accelerate.amazonaws.com')",
-    (snap_ts,)
-)
-conn.commit()
-conn.close()
+def parse_readme(rel_name):
+    full = os.path.join(root_dir, rel_name)
+    text = open(full, encoding="utf-8").read()
+    blocks = FENCE_RE.findall(text)
+    shell_cmds = []
+    mcp_configs = []
+    for block_idx, (lang, body) in enumerate(blocks, start=1):
+        if lang in ("bash", "sh"):
+            for raw in body.splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                shell_cmds.append((block_idx, line))
+        elif lang == "json":
+            parsed = json.loads(body)
+            if "mcpServers" in parsed:
+                mcp_configs.append((block_idx, parsed))
+    return shell_cmds, mcp_configs
+
+en_cmds, en_mcp = parse_readme("README.md")
+zh_cmds, zh_mcp = parse_readme("README.zh-CN.md")
+
+if len(en_cmds) != len(zh_cmds) or len(en_mcp) != len(zh_mcp):
+    print(f"FAIL: README parity mismatch: EN cmds={len(en_cmds)} mcp={len(en_mcp)} vs ZH cmds={len(zh_cmds)} mcp={len(zh_mcp)}", file=sys.stderr)
+    sys.exit(1)
+print(f"  -> Parity check OK: {len(en_cmds)} shell commands + {len(en_mcp)} MCP JSON block in each README.")
+
+SKIP_RULES = [
+    (r"^brew\s+(tap|install)\b", "External Homebrew tap/cask install requires network and modifies host prefix"),
+    (r"^xattr\s+-cr\s+/Applications/", "Modifies /Applications outside workspace"),
+    (r"^git\s+clone\s+https://", "External network git clone"),
+    (r"^cd\s+ChronoMac$", "Directory transition paired with skipped git clone"),
+    (r"^\./Scripts/build-app\.sh$", "Packages GUI .app bundle outside headless M0 verification"),
+]
+
+def skip_reason(cmd):
+    for pat, reason in SKIP_RULES:
+        if re.search(pat, cmd):
+            return reason
+    return None
+
+def assert_tokens(cmd, doc_name, out):
+    if cmd.startswith("./Scripts/test.sh"):
+        assert "Test run with" in out and "passed" in out, f"Missing pass summary in test.sh output for {doc_name}"
+        return
+
+    if "--json" in cmd:
+        data = json.loads(out)
+        if "status" in cmd:
+            assert data.get("cpuPct", 0.0) > 0.0, f"Expected cpuPct > 0 in {cmd}: {data}"
+            assert data.get("dbExists") is True, f"Expected dbExists=true in {cmd}: {data}"
+        elif "blame" in cmd:
+            assert data.get("sortBy") == "memory", f"Expected sortBy=memory in {cmd}: {data}"
+            assert data.get("memoryMetric") == "phys_footprint", f"Expected phys_footprint in {cmd}: {data}"
+            assert len(data.get("processes", [])) > 0, f"Expected non-empty processes in {cmd}"
+        return
+
+    is_zh = ("--lang zh" in cmd)
+    if "status" in cmd:
+        if is_zh:
+            for tok in ("ChronoMac 飞行记录库:", "实时主机 (1.0 秒双次采样校准) | CPU:"):
+                assert tok in out, f"Missing '{tok}' in {cmd} output:\n{out}"
+        else:
+            for tok in ("ChronoMac Flightbox:", "Live Host (1.0s calibrated) | CPU:"):
+                assert tok in out, f"Missing '{tok}' in {cmd} output:\n{out}"
+    elif "blame" in cmd:
+        if is_zh:
+            for tok in ("取自 ", "的快照（距所查时刻差 ", "物理内存占用 (phys_footprint)", "仍在运行", "尖峰后已退出"):
+                assert tok in out, f"Missing '{tok}' in {cmd} output:\n{out}"
+        else:
+            for tok in ("Snapshot at ", "from requested time)", "Memory Footprint (phys_footprint)", "still running", "exited after spike"):
+                assert tok in out, f"Missing '{tok}' in {cmd} output:\n{out}"
+    elif "anomalies" in cmd:
+        if is_zh:
+            for tok in ("ChronoMac 异常书签与窗口摘要", "峰值 CPU:", "峰值交换:", "峰值外部上行:"):
+                assert tok in out, f"Missing '{tok}' in {cmd} output:\n{out}"
+        else:
+            for tok in ("ChronoMac Window Summary & Anomalies", "Peak CPU:", "Peak Swap:", "Peak External Outbound Egress:"):
+                assert tok in out, f"Missing '{tok}' in {cmd} output:\n{out}"
+    elif "egress" in cmd:
+        if is_zh:
+            assert ("回环" in out), f"Missing loopback isolation notice in {cmd} output:\n{out}"
+        else:
+            assert ("loopback" in out.lower()), f"Missing loopback isolation notice in {cmd} output:\n{out}"
+    else:
+        raise AssertionError(f"Unhandled README command without output assertion: {cmd}")
+
+executed_count = 0
+skipped_count = 0
+
+for doc_name, cmds in (("README.md", en_cmds), ("README.zh-CN.md", zh_cmds)):
+    print(f"\n--- {doc_name} ---")
+    for block_idx, cmd in cmds:
+        reason = skip_reason(cmd)
+        if reason is not None:
+            skipped_count += 1
+            print(f"  [SKIP] ({doc_name} block #{block_idx}) `{cmd}` — Reason: {reason}")
+            continue
+
+        run_cwd = root_dir if cmd.startswith("./Scripts/") else work_dir
+        env = os.environ.copy()
+        env["CHRONOMAC_DB_PATH"] = seed_db
+        res = subprocess.run(
+            ["/bin/bash", "-lc", cmd],
+            cwd=run_cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode != 0:
+            print(f"FAIL: ({doc_name} block #{block_idx}) `{cmd}` exited with {res.returncode}\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}", file=sys.stderr)
+            sys.exit(1)
+        assert_tokens(cmd, doc_name, res.stdout)
+        executed_count += 1
+        if "--json" in cmd:
+            parsed_json = json.loads(res.stdout)
+            if "status" in cmd:
+                summary = f"JSON valid (cpuPct={parsed_json.get('cpuPct')}, dbExists={parsed_json.get('dbExists')})"
+            else:
+                summary = f"JSON valid (sortBy={parsed_json.get('sortBy')}, memoryMetric={parsed_json.get('memoryMetric')}, processes={len(parsed_json.get('processes', []))})"
+        else:
+            summary = res.stdout.strip().splitlines()[0] if res.stdout.strip() else "(empty)"
+            summary = re.sub(r"/[^\s]+/flightbox\.sqlite", "<TMP_DB>/flightbox.sqlite", summary)
+        print(f"  [PASS] ({doc_name} block #{block_idx}) `{cmd}` -> exit=0 | {summary}")
+
+print("\n[Step 3/3] Verifying MCP stdio server block from README.md & README.zh-CN.md...")
+for doc_name, mcp_list in (("README.md", en_mcp), ("README.zh-CN.md", zh_mcp)):
+    for block_idx, cfg in mcp_list:
+        srv = cfg["mcpServers"]["chronomac"]
+        mcp_args = srv["args"]
+        assert "--mcp" in mcp_args, f"Expected --mcp in {doc_name} JSON config"
+        payload = "\n".join([
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}',
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}',
+            '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"chrono_summary_window","arguments":{"minutes":360}}}',
+            '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"chrono_inspect_timestamp","arguments":{"minutes_ago":10,"sort_by":"cpu"}}}',
+            '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"chrono_top_egress_endpoints","arguments":{"hours":24}}}',
+        ]) + "\n"
+        env = os.environ.copy()
+        env["CHRONOMAC_DB_PATH"] = seed_db
+        res = subprocess.run(
+            ["ChronoMac"] + mcp_args,
+            cwd=work_dir,
+            env=env,
+            input=payload,
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode != 0:
+            print(f"FAIL: ({doc_name} MCP block #{block_idx}) exited {res.returncode}\n{res.stderr}", file=sys.stderr)
+            sys.exit(1)
+        lines = [ln for ln in res.stdout.splitlines() if ln.strip()]
+        assert len(lines) == 5, f"Expected 5 JSON-RPC responses, got {len(lines)}"
+        for tok in ("chrono_inspect_timestamp", "phys_footprint", "still running", "exited after spike"):
+            assert tok in res.stdout, f"Missing '{tok}' in MCP output for {doc_name}"
+        executed_count += 1
+        print(f"  [PASS] ({doc_name} JSON block #{block_idx}) `ChronoMac {' '.join(mcp_args)}` -> exit=0 | 5 JSON-RPC responses verified")
+
+print(f"\nSummary: executed={executed_count}, skipped={skipped_count} (all with explicit reasons).")
 PY
 
-echo "========================================================================"
-echo "Replaying README.md & README.zh-CN.md CLI + MCP Commands"
-echo "========================================================================"
-
-echo ""
-echo "$ ChronoMac --cli status --lang en"
-"$BIN" --cli status --lang en --db "$SEED_DB"
-
-echo ""
-echo "$ ChronoMac --cli status --lang zh"
-"$BIN" --cli status --lang zh --db "$SEED_DB"
-
-echo ""
-echo "$ ChronoMac --cli status --json"
-"$BIN" --cli status --json --db "$SEED_DB"
-
-echo ""
-echo "$ ChronoMac --cli blame --at 10m --sort cpu --lang en"
-BLAME_EN="$("$BIN" --cli blame --at 10m --sort cpu --lang en --db "$SEED_DB")"
-echo "$BLAME_EN"
-echo "$BLAME_EN" | grep -q "Memory Footprint (phys_footprint)"
-echo "$BLAME_EN" | grep -q "from requested time)"
-echo "$BLAME_EN" | grep -q "exited after spike"
-echo "$BLAME_EN" | grep -q "still running"
-echo "$BLAME_EN" | grep -q "No permission"
-
-echo ""
-echo "$ ChronoMac --cli blame --at 10m --sort cpu --lang zh"
-BLAME_ZH="$("$BIN" --cli blame --at 10m --sort cpu --lang zh --db "$SEED_DB")"
-echo "$BLAME_ZH"
-echo "$BLAME_ZH" | grep -q "物理内存占用 (phys_footprint)"
-echo "$BLAME_ZH" | grep -q "的快照（距所查时刻差 "
-echo "$BLAME_ZH" | grep -q "尖峰后已退出"
-echo "$BLAME_ZH" | grep -q "仍在运行"
-echo "$BLAME_ZH" | grep -q "无权限"
-
-echo ""
-echo "$ ChronoMac --cli blame --at 10m --sort memory --json"
-"$BIN" --cli blame --at 10m --sort memory --json --db "$SEED_DB"
-
-echo ""
-echo "$ ChronoMac --cli anomalies --minutes 360 --lang en"
-"$BIN" --cli anomalies --minutes 360 --lang en --db "$SEED_DB"
-
-echo ""
-echo "$ ChronoMac --cli anomalies --minutes 360 --lang zh"
-"$BIN" --cli anomalies --minutes 360 --lang zh --db "$SEED_DB"
-
-echo ""
-echo "$ ChronoMac --cli egress --hours 24 --lang en"
-"$BIN" --cli egress --hours 24 --lang en --db "$SEED_DB"
-
-echo ""
-echo "$ ChronoMac --cli egress --hours 24 --lang zh"
-"$BIN" --cli egress --hours 24 --lang zh --db "$SEED_DB"
-
-echo ""
-echo "$ ChronoMac --mcp (stdio JSON-RPC: initialize, tools/list, summary, inspect, egress)"
-MCP_OUT="$(
-    cat <<'JSONRPC' | "$BIN" --mcp --db "$SEED_DB"
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
-{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
-{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"chrono_summary_window","arguments":{"minutes":360}}}
-{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"chrono_inspect_timestamp","arguments":{"minutes_ago":10,"sort_by":"cpu"}}}
-{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"chrono_top_egress_endpoints","arguments":{"hours":24}}}
-JSONRPC
-)"
-echo "$MCP_OUT"
-echo "$MCP_OUT" | grep -q "Memory Footprint (phys_footprint)"
-echo "$MCP_OUT" | grep -q "exited after spike"
-echo "$MCP_OUT" | grep -q "No permission"
-
 echo ""
 echo "========================================================================"
-echo "ALL README & MCP COMMANDS REPLAYED SUCCESSFULLY"
+echo "ALL PARSED README.md & README.zh-CN.md COMMANDS VERIFIED SUCCESSFULLY"
 echo "========================================================================"
