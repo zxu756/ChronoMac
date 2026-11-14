@@ -37,7 +37,7 @@ public final class AnomalyDetector: @unchecked Sendable {
                             culpritName: topMem?.name ?? "kernel_task",
                             culpritExec: topMem?.execPath ?? "",
                             metricBadge: "+\(ChronoFormatter.bytes(jump)) swap",
-                            summary: "Swap expanded by \(ChronoFormatter.bytes(jump)) to \(ChronoFormatter.bytes(tick.swapUsedBytes)); top resident consumer: \(topMem?.name ?? "system") (\(ChronoFormatter.bytes(topMem?.rssBytes ?? 0)))."
+                            summary: "Swap expanded by \(ChronoFormatter.bytes(jump)) to \(ChronoFormatter.bytes(tick.swapUsedBytes)); top memory footprint consumer: \(topMem?.name ?? "system") (\(ChronoFormatter.bytes(topMem?.rssBytes ?? 0)))."
                         )
                     )
                     recentSwapBaseline = (tick.ts, tick.swapUsedBytes)
@@ -47,7 +47,7 @@ public final class AnomalyDetector: @unchecked Sendable {
             recentSwapBaseline = (tick.ts, tick.swapUsedBytes)
         }
 
-        // 2. Outbound Network Spike (>= 6 MB/s egress)
+        // 2. Outbound External Network Spike (>= 6 MB/s external egress; loopback never included)
         if tick.netOutBps >= 6 * 1024 * 1024, canFire(.egressBurst, now: tick.ts) {
             let topNet = processes.max(by: { $0.netOutBps < $1.netOutBps })
             bookmarks.append(
@@ -64,7 +64,7 @@ public final class AnomalyDetector: @unchecked Sendable {
         }
 
         // 3. Runaway Process CPU (>= 220% multi-core saturation)
-        if let hot = processes.first(where: { $0.cpuPct >= 220.0 }), canFire(.runawayCPU, now: tick.ts) {
+        if let hot = processes.first(where: { $0.isCPUReadable && $0.cpuPct >= 220.0 }), canFire(.runawayCPU, now: tick.ts) {
             bookmarks.append(
                 AnomalyBookmark(
                     ts: tick.ts,
@@ -80,7 +80,7 @@ public final class AnomalyDetector: @unchecked Sendable {
 
         // 4. Thermal Throttling
         if tick.thermalGrade.rawValue >= ThermalGrade.serious.rawValue, canFire(.thermalThrottle, now: tick.ts) {
-            let topCPU = processes.max(by: { $0.cpuPct < $1.cpuPct })
+            let topCPU = processes.filter(\.isCPUReadable).max(by: { $0.cpuPct < $1.cpuPct })
             bookmarks.append(
                 AnomalyBookmark(
                     ts: tick.ts,
@@ -94,10 +94,12 @@ public final class AnomalyDetector: @unchecked Sendable {
             )
         }
 
-        // 5. High-volume new external endpoint (>= 5 MB transfer on unseen host)
+        // 5. High-volume new external endpoint (>= 5 MB transfer on unseen external host; loopback never allowed)
+        let externalSockets = sockets.filter { !NettopDeltaParser.isLoopbackOrLinkLocal($0.remoteEndpoint) }
         let isInitialSeed = seenEndpoints.isEmpty
-        for s in sockets {
-            let key = "\(s.execPath)|\(NettopDeltaParser.extractRemoteIP(s.remoteEndpoint))"
+        for s in externalSockets {
+            let ownerIdentity = s.execPath.isEmpty ? s.processName : s.execPath
+            let key = "\(ownerIdentity)|\(NettopDeltaParser.extractRemoteIP(s.remoteEndpoint))"
             let unseen = seenEndpoints.insert(key).inserted
             if !isInitialSeed && unseen && (s.totalBytesOut + s.totalBytesIn) >= 5 * 1024 * 1024 && canFire(.newExternalHost, now: tick.ts) {
                 bookmarks.append(

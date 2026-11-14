@@ -9,6 +9,9 @@ public final class ChronoMonitor: ObservableObject {
     @Published public var selectedRange: TimeRangeWindow = .sixHours {
         didSet { reloadWindowFromStore() }
     }
+    @Published public var selectedSortOrder: ProcessSortOrder = .cpu {
+        didSet { refreshDisplayedProcesses() }
+    }
     @Published public var ticks: [SystemTick] = []
     @Published public var scrubbedTimestamp: Int64?
     @Published public var displayedSnapshotTs: Int64?
@@ -23,10 +26,8 @@ public final class ChronoMonitor: ObservableObject {
 
     public let isStaticPreview: Bool
     public let store: FlightboxStore?
+    public let sampler: any SystemSamplerProtocol
 
-    private let hostSampler = MachSystemSampler()
-    private let procSampler = ProcessTreeSampler()
-    private let netSampler = NettopDeltaParser()
     private let anomalyDetector = AnomalyDetector()
     private let dnsResolver = ReverseDNSResolver()
     private var livePIDs: Set<Int> = []
@@ -35,21 +36,31 @@ public final class ChronoMonitor: ObservableObject {
 
     public init(
         store: FlightboxStore? = nil,
+        sampler: any SystemSamplerProtocol = LiveSystemSampler(),
         isStaticPreview: Bool = false,
+        startSamplingTimer: Bool = true,
         sampleInterval: TimeInterval = 2.0
     ) {
         self.isStaticPreview = isStaticPreview
+        self.sampler = sampler
         if isStaticPreview {
             self.store = store
         } else {
             self.store = try? (store ?? FlightboxStore())
-            captureLiveTick()
-            self.sampleTimer = Timer.scheduledTimer(withTimeInterval: sampleInterval, repeats: true) { [weak self] _ in
-                Task { @MainActor [weak self] in
-                    self?.captureLiveTick()
+            if startSamplingTimer {
+                captureLiveTick()
+                self.sampleTimer = Timer.scheduledTimer(withTimeInterval: sampleInterval, repeats: true) { [weak self] _ in
+                    Task { @MainActor [weak self] in
+                        self?.captureLiveTick()
+                    }
                 }
             }
         }
+    }
+
+    public func stopSampling() {
+        sampleTimer?.invalidate()
+        sampleTimer = nil
     }
 
     public var isHistoricalReplay: Bool {
@@ -68,30 +79,39 @@ public final class ChronoMonitor: ObservableObject {
     }
 
     public func menuBarLabel(in language: AppLanguage) -> String {
+        let prefixDemo = isStaticPreview ? "[DEMO] " : ""
         guard let latest = ticks.last else {
-            return language == .zhHans ? "DVR 就绪" : "DVR Ready"
+            return prefixDemo + (language == .zhHans ? "DVR 就绪" : "DVR Ready")
         }
         if latest.swapUsedBytes >= 1_073_741_824 {
             let prefix = language == .zhHans ? "交换" : "Swap"
-            return String(format: "%.0f%% · %@ %@", latest.totalCPUPct, prefix, ChronoFormatter.bytes(latest.swapUsedBytes))
+            return prefixDemo + String(format: "%.0f%% · %@ %@", latest.totalCPUPct, prefix, ChronoFormatter.bytes(latest.swapUsedBytes))
         }
-        return String(format: "%.0f%% · ↑%@", latest.totalCPUPct, ChronoFormatter.rate(latest.netOutBps))
+        return prefixDemo + String(format: "%.0f%% · ↑%@", latest.totalCPUPct, ChronoFormatter.rate(latest.netOutBps))
     }
 
     public func scrub(to timestamp: Int64?) {
         scrubbedTimestamp = timestamp
+        refreshDisplayedProcesses()
+    }
+
+    private func refreshDisplayedProcesses() {
         guard !isStaticPreview, let store else {
-            if let ts = timestamp, let match = previewSnapshotsByTs[ts] {
+            if let ts = scrubbedTimestamp, let match = previewSnapshotsByTs[ts] {
                 displayedSnapshotTs = ts
-                displayedProcesses = match
-            } else if timestamp == nil, let latestTs = ticks.last?.ts, let match = previewSnapshotsByTs[latestTs] {
+                displayedProcesses = ProcessTreeSampler.sortProcesses(match, by: selectedSortOrder)
+            } else if scrubbedTimestamp == nil, let latestTs = ticks.last?.ts, let match = previewSnapshotsByTs[latestTs] {
                 displayedSnapshotTs = latestTs
-                displayedProcesses = match
+                displayedProcesses = ProcessTreeSampler.sortProcesses(match, by: selectedSortOrder)
             }
             return
         }
-        let target = timestamp ?? Int64(Date().timeIntervalSince1970)
-        let (actual, list) = store.queryNearestProcesses(at: target, livePIDs: livePIDs)
+        let target = scrubbedTimestamp ?? Int64(Date().timeIntervalSince1970)
+        let (actual, list) = store.queryNearestProcesses(
+            at: target,
+            livePIDs: livePIDs,
+            sortBy: selectedSortOrder
+        )
         displayedSnapshotTs = actual
         displayedProcesses = list
     }
@@ -124,29 +144,36 @@ public final class ChronoMonitor: ObservableObject {
         }
     }
 
-    public func captureLiveTick() {
+    public func captureLiveTick(nowOverride: Int64? = nil) {
         guard !isStaticPreview, let store else { return }
-        let now = Int64(Date().timeIntervalSince1970)
-        let host = hostSampler.sampleHostState()
-        let net = netSampler.sampleLiveHost(now: TimeInterval(now))
-        let (procs, diskR, diskW, aliveSet) = procSampler.sampleTopProcesses(
+        let now = nowOverride ?? Int64(Date().timeIntervalSince1970)
+        let host = sampler.sampleHostState()
+        let net = sampler.sampleNetwork(now: TimeInterval(now))
+        let procSnap = sampler.sampleProcesses(
             ts: now,
             netInBpsByPID: net.perPIDBytesInDelta,
             netOutBpsByPID: net.perPIDBytesOutDelta,
             limit: 30
         )
-        self.livePIDs = aliveSet
+        let procs = procSnap.processes
+        self.livePIDs = procSnap.livePIDs
 
-        let agentInfo = AgentActivityBridge.detectLiveAgentSummary(now: now)
+        let agentInfo = sampler.detectAgentActivity(now: now)
         self.agentWindows = agentInfo.recentWindows
 
-        let pidToExec = Dictionary(uniqueKeysWithValues: procs.map { ($0.pid, $0.execPath) })
+        var pidToExec: [Int: String] = [:]
+        for p in procs where !p.execPath.isEmpty {
+            pidToExec[p.pid] = p.execPath
+        }
+
         let bucketHour = (now / 3600) * 3600
         let socketRecords: [SocketFlowRecord] = net.externalSocketDeltas.map { s in
-            let exec = pidToExec[s.pid] ?? s.processName
+            // Never copy processName into execPath; leave "" if path cannot be resolved!
+            let resolvedExec = pidToExec[s.pid] ?? sampler.resolveExecutablePath(pid: s.pid)
+            let cleanExec = resolvedExec.hasPrefix("/") ? resolvedExec : ""
             return SocketFlowRecord(
                 bucketHour: bucketHour,
-                execPath: exec,
+                execPath: cleanExec,
                 processName: s.processName,
                 remoteEndpoint: s.remoteEndpoint,
                 hostname: nil,
@@ -165,12 +192,14 @@ public final class ChronoMonitor: ObservableObject {
             cpuSysPct: host.cpuSysPct,
             thermalGrade: host.thermal,
             memUsedBytes: host.memUsedBytes,
-            memTotalBytes: hostSampler.totalMemoryBytes,
+            memTotalBytes: sampler.totalMemoryBytes,
             swapUsedBytes: host.swapUsedBytes,
-            diskReadBps: diskR,
-            diskWriteBps: diskW,
+            diskReadBps: procSnap.totalDiskReadBps,
+            diskWriteBps: procSnap.totalDiskWriteBps,
             netInBps: net.totalInBps,
             netOutBps: net.totalOutBps,
+            loopbackInBps: net.loopbackRxBytesPerSec,
+            loopbackOutBps: net.loopbackTxBytesPerSec,
             activeAgentCount: agentInfo.count,
             activeAgentSummary: agentInfo.summary
         )
@@ -192,41 +221,45 @@ public final class ChronoMonitor: ObservableObject {
             try? store.runRollupAndRetention(now: now)
         }
 
-        reloadWindowFromStore()
+        reloadWindowFromStore(referenceNow: now)
     }
 
-    private func reloadWindowFromStore() {
+    private func reloadWindowFromStore(referenceNow: Int64? = nil) {
         guard !isStaticPreview, let store else { return }
-        let now = Int64(Date().timeIntervalSince1970)
+        let now = referenceNow ?? Int64(Date().timeIntervalSince1970)
         let start = now - selectedRange.durationSeconds
         ticks = store.queryTicks(from: start, to: now)
         anomalies = store.queryAnomalies(sinceTs: start, limit: 25)
         if scrubbedTimestamp == nil {
-            let (actual, list) = store.queryNearestProcesses(at: now, livePIDs: livePIDs)
+            let (actual, list) = store.queryNearestProcesses(
+                at: now,
+                livePIDs: livePIDs,
+                sortBy: selectedSortOrder
+            )
             displayedSnapshotTs = actual
             displayedProcesses = list
         }
-        reloadSocketFlows()
+        reloadSocketFlows(referenceNow: now)
     }
 
-    private func reloadSocketFlows() {
+    private func reloadSocketFlows(referenceNow: Int64? = nil) {
         guard !isStaticPreview, let store else { return }
-        let now = Int64(Date().timeIntervalSince1970)
+        let now = referenceNow ?? Int64(Date().timeIntervalSince1970)
         let start = now - selectedRange.durationSeconds
         socketFlows = store.querySocketFlows(sinceTs: start, execPathFilter: selectedProcessExecPath, limit: 20)
     }
 
-    // MARK: - Deterministic Forensic DVR Preview (03:14 AM Incident Replay)
+    // MARK: - Deterministic Forensic DVR Demo Preview (`--demo` / `--export-screenshots`)
 
     private var previewSnapshotsByTs: [Int64: [ProcessSample]] = [:]
 
     public static func preview() -> ChronoMonitor {
-        let m = ChronoMonitor(isStaticPreview: true)
-        // Anchor at 06:00:00 UTC so 6h window spans 00:00 .. 06:00 with a dramatic 03:14:00 spike
+        let m = ChronoMonitor(isStaticPreview: true, startSamplingTimer: false)
+        // Anchor at 06:00:00 UTC so 6h window spans 00:00 .. 06:00 with a synthetic 03:14:00 demo spike
         let endTs: Int64 = 1_794_549_600
         let startTs: Int64 = endTs - 21_600
-        let spikeTs: Int64 = startTs + 11_640 // ~03:14 into window
-        let memTotal: Int64 = 24 * 1024 * 1024 * 1024 // 24 GB unified memory
+        let spikeTs: Int64 = startTs + 11_640
+        let memTotal: Int64 = 24 * 1024 * 1024 * 1024
 
         var generatedTicks: [SystemTick] = []
         let count = 96
@@ -266,7 +299,7 @@ public final class ChronoMonitor: ObservableObject {
                     netInBps: netIn,
                     netOutBps: netOut,
                     activeAgentCount: agents,
-                    activeAgentSummary: agents == 2 ? "Claude Code, npx-mcp" : (agents == 3 ? "Claude, Codex, OpenCode" : "")
+                    activeAgentSummary: agents == 2 ? "Claude Code, OpenCode" : (agents == 3 ? "Claude Code, Codex CLI, OpenCode" : "")
                 )
             )
         }
@@ -283,28 +316,13 @@ public final class ChronoMonitor: ObservableObject {
                 bundleID: nil,
                 signingTeam: nil,
                 cpuPct: 312.4,
-                rssBytes: 8_942_206_976, // 8.33 GB
+                rssBytes: 8_942_206_976,
                 diskReadBps: 162_529_280,
                 diskWriteBps: 88_080_384,
                 netInBps: 1_240_000,
-                netOutBps: 16_986_931, // 16.2 MB/s
-                isAliveNow: false // Exited at 03:19 AM — caught by DVR!
-            ),
-            ProcessSample(
-                ts: actualSpikeTickTs,
-                pid: 49201,
-                ppid: 1204,
-                name: "claude",
-                execPath: "~/.local/bin/claude",
-                bundleID: "com.anthropic.claude-code",
-                signingTeam: "Q6L2SF6YDW",
-                cpuPct: 48.6,
-                rssBytes: 1_912_602_624,
-                diskReadBps: 14_200_000,
-                diskWriteBps: 3_100_000,
-                netInBps: 2_480_000,
-                netOutBps: 1_890_000,
-                isAliveNow: true
+                netOutBps: 16_986_931,
+                isAliveNow: false,
+                isCPUReadable: true
             ),
             ProcessSample(
                 ts: actualSpikeTickTs,
@@ -320,7 +338,25 @@ public final class ChronoMonitor: ObservableObject {
                 diskWriteBps: 0,
                 netInBps: 0,
                 netOutBps: 0,
-                isAliveNow: true
+                isAliveNow: true,
+                isCPUReadable: true
+            ),
+            ProcessSample(
+                ts: actualSpikeTickTs,
+                pid: 49201,
+                ppid: 1204,
+                name: "claude",
+                execPath: "~/.local/bin/claude",
+                bundleID: "com.anthropic.claude-code",
+                signingTeam: "Q6L2SF6YDW",
+                cpuPct: 48.6,
+                rssBytes: 1_912_602_624,
+                diskReadBps: 14_200_000,
+                diskWriteBps: 3_100_000,
+                netInBps: 2_480_000,
+                netOutBps: 1_890_000,
+                isAliveNow: true,
+                isCPUReadable: true
             ),
             ProcessSample(
                 ts: actualSpikeTickTs,
@@ -336,23 +372,8 @@ public final class ChronoMonitor: ObservableObject {
                 diskWriteBps: 4_800_000,
                 netInBps: 410_000,
                 netOutBps: 620_000,
-                isAliveNow: true
-            ),
-            ProcessSample(
-                ts: actualSpikeTickTs,
-                pid: 882,
-                ppid: 1,
-                name: "WindowServer",
-                execPath: "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
-                bundleID: "com.apple.WindowServer",
-                signingTeam: "Apple",
-                cpuPct: 12.1,
-                rssBytes: 812_646_400,
-                diskReadBps: 0,
-                diskWriteBps: 0,
-                netInBps: 0,
-                netOutBps: 0,
-                isAliveNow: true
+                isAliveNow: true,
+                isCPUReadable: true
             ),
             ProcessSample(
                 ts: actualSpikeTickTs,
@@ -368,7 +389,25 @@ public final class ChronoMonitor: ObservableObject {
                 diskWriteBps: 1_250_000,
                 netInBps: 88_000,
                 netOutBps: 940_000,
-                isAliveNow: false
+                isAliveNow: false,
+                isCPUReadable: true
+            ),
+            ProcessSample(
+                ts: actualSpikeTickTs,
+                pid: 168,
+                ppid: 1,
+                name: "WindowServer",
+                execPath: "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+                bundleID: "com.apple.WindowServer",
+                signingTeam: "Apple",
+                cpuPct: 0,
+                rssBytes: 0,
+                diskReadBps: 0,
+                diskWriteBps: 0,
+                netInBps: 0,
+                netOutBps: 0,
+                isAliveNow: true,
+                isCPUReadable: false
             )
         ]
 
@@ -376,8 +415,8 @@ public final class ChronoMonitor: ObservableObject {
         m.selectedRange = .sixHours
         m.scrubbedTimestamp = actualSpikeTickTs
         m.displayedSnapshotTs = actualSpikeTickTs
-        m.displayedProcesses = spikeProcesses
         m.previewSnapshotsByTs[actualSpikeTickTs] = spikeProcesses
+        m.displayedProcesses = ProcessTreeSampler.sortProcesses(spikeProcesses, by: m.selectedSortOrder)
 
         m.agentWindows = [
             AgentBurstWindow(id: "ag-1", vendor: "Claude Code", workspace: "shader-pipeline", startTs: actualSpikeTickTs - 900, endTs: actualSpikeTickTs + 1100),
@@ -394,7 +433,7 @@ public final class ChronoMonitor: ObservableObject {
                 culpritName: "mcp-vector-indexer (python3.12)",
                 culpritExec: "~/.local/share/uv/mcp-indexer/bin/python3",
                 metricBadge: "+6.02 GB swap",
-                summary: "Orphaned uv worker ballooned to 8.33 GB RSS & 16.2 MB/s upload before exiting 5m later."
+                summary: "Orphaned uv worker ballooned to 8.33 GB phys_footprint & 16.2 MB/s upload before exiting 5m later."
             ),
             AnomalyBookmark(
                 id: "bm-2",

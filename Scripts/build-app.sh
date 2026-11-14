@@ -32,7 +32,13 @@ codesign --force --deep --sign - "$APP_BUNDLE"
 codesign --verify --deep --strict "$APP_BUNDLE"
 
 echo "==> Rendering 2x Retina screenshots (EN + zh-Hans) to docs/..."
-"$APP_BUNDLE/Contents/MacOS/$APP_NAME" --export-screenshots "$ROOT/docs" --lang en
-"$APP_BUNDLE/Contents/MacOS/$APP_NAME" --export-screenshots "$ROOT/docs" --lang zh
+TMP_BUILD_ISO="$(mktemp -d "${TMPDIR:-/tmp}/chronomac-buildapp.XXXXXX")"
+trap 'rm -rf "$TMP_BUILD_ISO"' EXIT
+CHRONOMAC_DB_PATH="$TMP_BUILD_ISO/flightbox.sqlite" \
+CHRONOMAC_PREFS_SUITE="io.github.zxu756.ChronoMac.buildapp.$$" \
+    "$APP_BUNDLE/Contents/MacOS/$APP_NAME" --export-screenshots "$ROOT/docs" --lang en
+CHRONOMAC_DB_PATH="$TMP_BUILD_ISO/flightbox.sqlite" \
+CHRONOMAC_PREFS_SUITE="io.github.zxu756.ChronoMac.buildapp.$$" \
+    "$APP_BUNDLE/Contents/MacOS/$APP_NAME" --export-screenshots "$ROOT/docs" --lang zh
 
 echo "✓ Built $APP_BUNDLE"

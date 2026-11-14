@@ -5,20 +5,79 @@ private let SQLITE_TRANSIENT_DESTRUCTOR = unsafeBitCast(-1, to: sqlite3_destruct
 
 public final class FlightboxStore: @unchecked Sendable {
     public let dbPath: String
-    private var db: OpaquePointer?
-    private let lock = NSLock()
     public let maxDatabaseBytes: Int64
+    public let isReadOnly: Bool
+    private var db: OpaquePointer?
+    private var hasLoopbackColumns: Bool = true
+    private var hasProcessNameInSocketPK: Bool = true
+    private let lock = NSLock()
 
     public static var defaultDatabaseURL: URL {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         return appSupport.appendingPathComponent("ChronoMac/flightbox.sqlite")
     }
 
-    public init(databaseURL: URL = FlightboxStore.defaultDatabaseURL, maxDatabaseBytes: Int64 = 250 * 1024 * 1024) throws {
-        self.dbPath = databaseURL.path
-        self.maxDatabaseBytes = maxDatabaseBytes
+    public static func parseCLIDatabasePath(_ arguments: [String]) -> String? {
+        for (idx, arg) in arguments.enumerated() {
+            if arg == "--db", idx + 1 < arguments.count {
+                let val = arguments[idx + 1].trimmingCharacters(in: .whitespacesAndNewlines)
+                if !val.isEmpty { return val }
+            } else if arg.hasPrefix("--db=") {
+                let val = String(arg.dropFirst("--db=".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !val.isEmpty { return val }
+            }
+        }
+        return nil
+    }
 
-        let dir = databaseURL.deletingLastPathComponent()
+    public static func resolveDatabaseURL(
+        arguments: [String] = CommandLine.arguments,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> URL {
+        if let cliPath = parseCLIDatabasePath(arguments) {
+            return URL(fileURLWithPath: (cliPath as NSString).expandingTildeInPath)
+        }
+        if let envPath = environment["CHRONOMAC_DB_PATH"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !envPath.isEmpty {
+            return URL(fileURLWithPath: (envPath as NSString).expandingTildeInPath)
+        }
+        return defaultDatabaseURL
+    }
+
+    public init(
+        databaseURL: URL? = nil,
+        maxDatabaseBytes: Int64 = 250 * 1024 * 1024,
+        readOnly: Bool = false
+    ) throws {
+        let resolvedURL = databaseURL ?? Self.resolveDatabaseURL()
+        self.dbPath = resolvedURL.path
+        self.maxDatabaseBytes = maxDatabaseBytes
+        self.isReadOnly = readOnly
+
+        if readOnly {
+            guard FileManager.default.fileExists(atPath: dbPath) else {
+                self.db = nil
+                return
+            }
+            var handle: OpaquePointer?
+            let rc = sqlite3_open_v2(
+                dbPath,
+                &handle,
+                SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX,
+                nil
+            )
+            guard rc == SQLITE_OK, let opened = handle else {
+                let msg = handle.flatMap { sqlite3_errmsg($0) }.map { String(cString: $0) } ?? "SQLite read-only open failed"
+                if let handle { sqlite3_close(handle) }
+                throw NSError(domain: "ChronoMac.FlightboxStore", code: Int(rc), userInfo: [NSLocalizedDescriptionKey: msg])
+            }
+            self.db = opened
+            sqlite3_busy_timeout(opened, 2000)
+            self.hasLoopbackColumns = Self.tableHasColumn(db: opened, table: "system_ticks", column: "loopback_in_bps")
+            return
+        }
+
+        let dir = resolvedURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
 
         var handle: OpaquePointer?
@@ -44,12 +103,45 @@ public final class FlightboxStore: @unchecked Sendable {
         }
     }
 
+    private static func tableHasColumn(db: OpaquePointer, table: String, column: String) -> Bool {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "PRAGMA table_info(\(table));", -1, &stmt, nil) == SQLITE_OK, let s = stmt else {
+            return false
+        }
+        defer { sqlite3_finalize(s) }
+        while sqlite3_step(s) == SQLITE_ROW {
+            if let namePtr = sqlite3_column_text(s, 1),
+               String(cString: namePtr) == column {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func socketPKIncludesProcessName(db: OpaquePointer) -> Bool {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "PRAGMA table_info(socket_ledger);", -1, &stmt, nil) == SQLITE_OK, let s = stmt else {
+            return false
+        }
+        defer { sqlite3_finalize(s) }
+        while sqlite3_step(s) == SQLITE_ROW {
+            if let namePtr = sqlite3_column_text(s, 1),
+               String(cString: namePtr) == "process_name" {
+                return sqlite3_column_int(s, 5) > 0
+            }
+        }
+        return false
+    }
+
     private func bootstrapSchema() throws {
+        guard let db else { return }
+        // IMPORTANT: auto_vacuum = INCREMENTAL must precede journal_mode = WAL on new databases
+        // so page 1 is initialized with incremental pointer-map support.
         let ddl = """
+        PRAGMA auto_vacuum = INCREMENTAL;
         PRAGMA journal_mode = WAL;
         PRAGMA synchronous = NORMAL;
         PRAGMA temp_store = MEMORY;
-        PRAGMA auto_vacuum = INCREMENTAL;
 
         CREATE TABLE IF NOT EXISTS system_ticks (
             ts INTEGER PRIMARY KEY,
@@ -64,6 +156,8 @@ public final class FlightboxStore: @unchecked Sendable {
             disk_write_bps INTEGER NOT NULL,
             net_in_bps INTEGER NOT NULL,
             net_out_bps INTEGER NOT NULL,
+            loopback_in_bps INTEGER NOT NULL DEFAULT 0,
+            loopback_out_bps INTEGER NOT NULL DEFAULT 0,
             active_agent_count INTEGER NOT NULL DEFAULT 0,
             active_agent_summary TEXT NOT NULL DEFAULT ''
         );
@@ -99,7 +193,7 @@ public final class FlightboxStore: @unchecked Sendable {
             total_bytes_out INTEGER NOT NULL,
             first_seen INTEGER NOT NULL,
             last_seen INTEGER NOT NULL,
-            PRIMARY KEY (bucket_hour, exec_path, remote_endpoint)
+            PRIMARY KEY (bucket_hour, exec_path, process_name, remote_endpoint)
         );
         CREATE INDEX IF NOT EXISTS idx_socket_last_seen ON socket_ledger(last_seen DESC);
 
@@ -116,6 +210,15 @@ public final class FlightboxStore: @unchecked Sendable {
         CREATE INDEX IF NOT EXISTS idx_anomaly_ts ON anomaly_bookmarks(ts DESC);
         """
         try execRaw(ddl)
+
+        if !Self.tableHasColumn(db: db, table: "system_ticks", column: "loopback_in_bps") {
+            try execRaw("ALTER TABLE system_ticks ADD COLUMN loopback_in_bps INTEGER NOT NULL DEFAULT 0;")
+        }
+        if !Self.tableHasColumn(db: db, table: "system_ticks", column: "loopback_out_bps") {
+            try execRaw("ALTER TABLE system_ticks ADD COLUMN loopback_out_bps INTEGER NOT NULL DEFAULT 0;")
+        }
+        self.hasLoopbackColumns = true
+        self.hasProcessNameInSocketPK = Self.socketPKIncludesProcessName(db: db)
     }
 
     private func execRaw(_ sql: String) throws {
@@ -129,6 +232,34 @@ public final class FlightboxStore: @unchecked Sendable {
         }
     }
 
+    private func querySingleInt64(_ sql: String) -> Int64 {
+        guard let db else { return 0 }
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let s = stmt else { return 0 }
+        defer { sqlite3_finalize(s) }
+        return sqlite3_step(s) == SQLITE_ROW ? sqlite3_column_int64(s, 0) : 0
+    }
+
+    public func totalStorageBytes() -> Int64 {
+        let fm = FileManager.default
+        var total: Int64 = 0
+        for path in [dbPath, dbPath + "-wal", dbPath + "-shm"] {
+            if let attrs = try? fm.attributesOfItem(atPath: path),
+               let sz = attrs[.size] as? Int64 {
+                total += sz
+            }
+        }
+        return total
+    }
+
+    private func walFileBytes() -> Int64 {
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: dbPath + "-wal"),
+           let sz = attrs[.size] as? Int64 {
+            return sz
+        }
+        return 0
+    }
+
     // MARK: - Write Path
 
     public func recordSampleBatch(
@@ -139,7 +270,7 @@ public final class FlightboxStore: @unchecked Sendable {
     ) throws {
         lock.lock()
         defer { lock.unlock() }
-        guard let db else { return }
+        guard let db, !isReadOnly else { return }
 
         try execRaw("BEGIN IMMEDIATE TRANSACTION;")
         do {
@@ -162,11 +293,31 @@ public final class FlightboxStore: @unchecked Sendable {
 
     private func insertTick(_ t: SystemTick, db: OpaquePointer) throws {
         let sql = """
-        INSERT OR REPLACE INTO system_ticks (
+        INSERT INTO system_ticks (
             ts, tier, cpu_user, cpu_sys, thermal_level, mem_used_bytes, mem_total_bytes,
             swap_used_bytes, disk_read_bps, disk_write_bps, net_in_bps, net_out_bps,
-            active_agent_count, active_agent_summary
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            loopback_in_bps, loopback_out_bps, active_agent_count, active_agent_summary
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(ts) DO UPDATE SET
+            tier = MAX(system_ticks.tier, excluded.tier),
+            cpu_user = MAX(system_ticks.cpu_user, excluded.cpu_user),
+            cpu_sys = MAX(system_ticks.cpu_sys, excluded.cpu_sys),
+            thermal_level = MAX(system_ticks.thermal_level, excluded.thermal_level),
+            mem_used_bytes = MAX(system_ticks.mem_used_bytes, excluded.mem_used_bytes),
+            mem_total_bytes = MAX(system_ticks.mem_total_bytes, excluded.mem_total_bytes),
+            swap_used_bytes = MAX(system_ticks.swap_used_bytes, excluded.swap_used_bytes),
+            disk_read_bps = MAX(system_ticks.disk_read_bps, excluded.disk_read_bps),
+            disk_write_bps = MAX(system_ticks.disk_write_bps, excluded.disk_write_bps),
+            net_in_bps = MAX(system_ticks.net_in_bps, excluded.net_in_bps),
+            net_out_bps = MAX(system_ticks.net_out_bps, excluded.net_out_bps),
+            loopback_in_bps = MAX(system_ticks.loopback_in_bps, excluded.loopback_in_bps),
+            loopback_out_bps = MAX(system_ticks.loopback_out_bps, excluded.loopback_out_bps),
+            active_agent_count = MAX(system_ticks.active_agent_count, excluded.active_agent_count),
+            active_agent_summary = CASE
+                WHEN LENGTH(excluded.active_agent_summary) >= LENGTH(system_ticks.active_agent_summary)
+                THEN excluded.active_agent_summary
+                ELSE system_ticks.active_agent_summary
+            END;
         """
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let s = stmt else { return }
@@ -184,8 +335,10 @@ public final class FlightboxStore: @unchecked Sendable {
         sqlite3_bind_int64(s, 10, t.diskWriteBps)
         sqlite3_bind_int64(s, 11, t.netInBps)
         sqlite3_bind_int64(s, 12, t.netOutBps)
-        sqlite3_bind_int(s, 13, Int32(t.activeAgentCount))
-        sqlite3_bind_text(s, 14, t.activeAgentSummary, -1, SQLITE_TRANSIENT_DESTRUCTOR)
+        sqlite3_bind_int64(s, 13, t.loopbackInBps)
+        sqlite3_bind_int64(s, 14, t.loopbackOutBps)
+        sqlite3_bind_int(s, 15, Int32(t.activeAgentCount))
+        sqlite3_bind_text(s, 16, t.activeAgentSummary, -1, SQLITE_TRANSIENT_DESTRUCTOR)
         _ = sqlite3_step(s)
     }
 
@@ -215,7 +368,8 @@ public final class FlightboxStore: @unchecked Sendable {
         } else {
             sqlite3_bind_null(s, 7)
         }
-        sqlite3_bind_double(s, 8, p.cpuPct)
+        let encodedCPU = p.isCPUReadable ? p.cpuPct : -1.0
+        sqlite3_bind_double(s, 8, encodedCPU)
         sqlite3_bind_int64(s, 9, p.rssBytes)
         sqlite3_bind_int64(s, 10, p.diskReadBps)
         sqlite3_bind_int64(s, 11, p.diskWriteBps)
@@ -225,12 +379,15 @@ public final class FlightboxStore: @unchecked Sendable {
     }
 
     private func upsertSocket(_ rec: SocketFlowRecord, db: OpaquePointer) throws {
+        let conflictCols = hasProcessNameInSocketPK
+            ? "bucket_hour, exec_path, process_name, remote_endpoint"
+            : "bucket_hour, exec_path, remote_endpoint"
         let sql = """
         INSERT INTO socket_ledger (
             bucket_hour, exec_path, process_name, remote_endpoint, hostname, proto,
             total_bytes_in, total_bytes_out, first_seen, last_seen
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(bucket_hour, exec_path, remote_endpoint) DO UPDATE SET
+        ON CONFLICT(\(conflictCols)) DO UPDATE SET
             total_bytes_in = socket_ledger.total_bytes_in + excluded.total_bytes_in,
             total_bytes_out = socket_ledger.total_bytes_out + excluded.total_bytes_out,
             hostname = COALESCE(excluded.hostname, socket_ledger.hostname),
@@ -281,7 +438,7 @@ public final class FlightboxStore: @unchecked Sendable {
     public func updateHostname(for remoteEndpoint: String, hostname: String) {
         lock.lock()
         defer { lock.unlock() }
-        guard let db else { return }
+        guard let db, !isReadOnly else { return }
         let sql = "UPDATE socket_ledger SET hostname = ? WHERE remote_endpoint = ? AND hostname IS NULL;"
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let s = stmt else { return }
@@ -291,13 +448,15 @@ public final class FlightboxStore: @unchecked Sendable {
         _ = sqlite3_step(s)
     }
 
-    // MARK: - 3-Tier Peak-Preserving Rollup & Retention Cap
+    // MARK: - 3-Tier Peak-Preserving Rollup & Hard Storage Cap
 
-    /// Compacts Tier 0 (< now-2h) into 15s buckets, Tier 1 (< now-24h) into 60s buckets,
-    /// prunes data older than 7 days, and enforces the 250 MB hard cap.
+    /// Compacts completed Tier 0 buckets (< now-2h) into 15s buckets, completed Tier 1 buckets (< now-24h)
+    /// into 60s buckets, prunes data older than 7 days, reclaims free pages, and enforces `maxDatabaseBytes`
+    /// across `.sqlite` + `-wal` + `-shm` without any 48-hour immunity window.
     public func runRollupAndRetention(now: Int64) throws {
         lock.lock()
         defer { lock.unlock() }
+        guard !isReadOnly, db != nil else { return }
 
         let twoHoursAgo = now - 7_200
         let dayAgo = now - 86_400
@@ -305,9 +464,9 @@ public final class FlightboxStore: @unchecked Sendable {
 
         try execRaw("BEGIN IMMEDIATE TRANSACTION;")
         do {
-            // Tier 0 -> Tier 1 (15s peak-preserving rollup)
+            // Tier 0 -> Tier 1 (15s peak-preserving rollup; only fully elapsed buckets)
             try compactTier(fromTier: 0, toTier: 1, bucketSec: 15, olderThan: twoHoursAgo)
-            // Tier 1 -> Tier 2 (60s peak-preserving rollup)
+            // Tier 1 -> Tier 2 (60s peak-preserving rollup; only fully elapsed buckets)
             try compactTier(fromTier: 1, toTier: 2, bucketSec: 60, olderThan: dayAgo)
 
             // Prune > 7 days
@@ -323,25 +482,113 @@ public final class FlightboxStore: @unchecked Sendable {
             throw error
         }
 
-        // Enforce 250 MB ceiling
-        if let attrs = try? FileManager.default.attributesOfItem(atPath: dbPath),
-           let size = attrs[.size] as? Int64,
-           size > maxDatabaseBytes {
-            let trimCut = now - 172_800 // Keep recent 48h if exceeding ceiling
-            try execRaw("""
-            DELETE FROM process_snapshots WHERE ts < \(trimCut);
-            DELETE FROM system_ticks WHERE ts < \(trimCut) AND tier > 0;
-            PRAGMA incremental_vacuum(2048);
-            """)
+        // Reclaim free pages or oversized WAL before checking hard cap
+        let walThreshold = max(256 * 1024, maxDatabaseBytes / 4)
+        let freePages = querySingleInt64("PRAGMA freelist_count;")
+        let totalPages = max(1, querySingleInt64("PRAGMA page_count;"))
+        if totalStorageBytes() > maxDatabaseBytes || walFileBytes() >= walThreshold || (freePages > 128 && freePages * 4 > totalPages) {
+            let autoVacMode = querySingleInt64("PRAGMA auto_vacuum;")
+            if autoVacMode == 2 {
+                try? execRaw("PRAGMA incremental_vacuum;")
+            } else if freePages > 64 {
+                try? execRaw("VACUUM;")
+            }
+            try? execRaw("PRAGMA wal_checkpoint(TRUNCATE);")
+        }
+
+        // Enforce hard storage ceiling (sqlite + wal + shm <= maxDatabaseBytes), oldest-first, no 48h immunity
+        var guardIterations = 0
+        while totalStorageBytes() > maxDatabaseBytes && guardIterations < 40 {
+            guardIterations += 1
+            let procCount = querySingleInt64("SELECT COUNT(*) FROM process_snapshots;")
+            let tickCount = querySingleInt64("SELECT COUNT(*) FROM system_ticks;")
+            let sockCount = querySingleInt64("SELECT COUNT(*) FROM socket_ledger;")
+            let anomCount = querySingleInt64("SELECT COUNT(*) FROM anomaly_bookmarks;")
+
+            if procCount == 0 && tickCount == 0 && sockCount == 0 && anomCount == 0 {
+                try execRaw("VACUUM;")
+                try execRaw("PRAGMA wal_checkpoint(TRUNCATE);")
+                break
+            }
+
+            let procTrim = procCount > 0 ? max(1, procCount / 5) : 0
+            let tickTrim = tickCount > 0 ? max(1, tickCount / 5) : 0
+            let sockTrim = sockCount > 0 ? max(1, sockCount / 5) : 0
+            let anomTrim = anomCount > 0 ? max(1, anomCount / 5) : 0
+
+            try execRaw("BEGIN IMMEDIATE TRANSACTION;")
+            do {
+                if procTrim > 0 {
+                    try execRaw("""
+                    DELETE FROM process_snapshots
+                    WHERE rowid IN (SELECT rowid FROM process_snapshots ORDER BY ts ASC, rowid ASC LIMIT \(procTrim));
+                    """)
+                }
+                if tickTrim > 0 {
+                    try execRaw("""
+                    DELETE FROM system_ticks
+                    WHERE rowid IN (SELECT rowid FROM system_ticks ORDER BY ts ASC, rowid ASC LIMIT \(tickTrim));
+                    """)
+                }
+                if sockTrim > 0 {
+                    try execRaw("""
+                    DELETE FROM socket_ledger
+                    WHERE rowid IN (SELECT rowid FROM socket_ledger ORDER BY last_seen ASC, rowid ASC LIMIT \(sockTrim));
+                    """)
+                }
+                if anomTrim > 0 {
+                    try execRaw("""
+                    DELETE FROM anomaly_bookmarks
+                    WHERE rowid IN (SELECT rowid FROM anomaly_bookmarks ORDER BY ts ASC, rowid ASC LIMIT \(anomTrim));
+                    """)
+                }
+                try execRaw("COMMIT;")
+            } catch {
+                try? execRaw("ROLLBACK;")
+                throw error
+            }
+
+            try execRaw("VACUUM;")
+            try execRaw("PRAGMA wal_checkpoint(TRUNCATE);")
         }
     }
 
     private func compactTier(fromTier: Int, toTier: Int, bucketSec: Int64, olderThan cutoff: Int64) throws {
+        guard cutoff > 0 else { return }
+        // Only compact a bucket [b_ts, b_ts + bucketSec) once the ENTIRE bucket has strictly passed cutoff.
+        let alignedCutoff = (cutoff / bucketSec) * bucketSec
+        guard alignedCutoff > 0 else { return }
+
+        // Check fast via index whether any source-tier rows exist before alignedCutoff
+        let candidateCount = querySingleInt64(
+            "SELECT COUNT(*) FROM system_ticks WHERE tier = \(fromTier) AND ts < \(alignedCutoff) LIMIT 1;"
+        )
+        guard candidateCount > 0 else { return }
+
+        let minCandidateTs = querySingleInt64(
+            "SELECT MIN(ts) FROM system_ticks WHERE tier = \(fromTier) AND ts < \(alignedCutoff);"
+        )
+        let alignedStart = (minCandidateTs / bucketSec) * bucketSec
+
         let sql = """
-        INSERT OR REPLACE INTO system_ticks (
+        DELETE FROM process_snapshots
+        WHERE ts >= \(alignedStart) AND ts < \(alignedCutoff)
+          AND ts NOT IN (
+              SELECT peak_ts FROM (
+                  SELECT ts AS peak_ts,
+                         ROW_NUMBER() OVER (
+                             PARTITION BY (ts / \(bucketSec)) * \(bucketSec)
+                             ORDER BY (cpu_user + cpu_sys) DESC, mem_used_bytes DESC, (net_in_bps + net_out_bps) DESC, ts ASC
+                         ) AS rn
+                  FROM system_ticks
+                  WHERE ts >= \(alignedStart) AND ts < \(alignedCutoff)
+              ) WHERE rn = 1
+          );
+
+        INSERT INTO system_ticks (
             ts, tier, cpu_user, cpu_sys, thermal_level, mem_used_bytes, mem_total_bytes,
             swap_used_bytes, disk_read_bps, disk_write_bps, net_in_bps, net_out_bps,
-            active_agent_count, active_agent_summary
+            loopback_in_bps, loopback_out_bps, active_agent_count, active_agent_summary
         )
         SELECT
             (ts / \(bucketSec)) * \(bucketSec) AS b_ts,
@@ -356,18 +603,36 @@ public final class FlightboxStore: @unchecked Sendable {
             MAX(disk_write_bps),
             MAX(net_in_bps),
             MAX(net_out_bps),
+            MAX(loopback_in_bps),
+            MAX(loopback_out_bps),
             MAX(active_agent_count),
             MAX(active_agent_summary)
         FROM system_ticks
-        WHERE tier = \(fromTier) AND ts < \(cutoff)
-        GROUP BY b_ts;
+        WHERE tier = \(fromTier) AND ts >= \(alignedStart) AND ts < \(alignedCutoff)
+        GROUP BY b_ts
+        ON CONFLICT(ts) DO UPDATE SET
+            tier = MAX(system_ticks.tier, excluded.tier),
+            cpu_user = MAX(system_ticks.cpu_user, excluded.cpu_user),
+            cpu_sys = MAX(system_ticks.cpu_sys, excluded.cpu_sys),
+            thermal_level = MAX(system_ticks.thermal_level, excluded.thermal_level),
+            mem_used_bytes = MAX(system_ticks.mem_used_bytes, excluded.mem_used_bytes),
+            mem_total_bytes = MAX(system_ticks.mem_total_bytes, excluded.mem_total_bytes),
+            swap_used_bytes = MAX(system_ticks.swap_used_bytes, excluded.swap_used_bytes),
+            disk_read_bps = MAX(system_ticks.disk_read_bps, excluded.disk_read_bps),
+            disk_write_bps = MAX(system_ticks.disk_write_bps, excluded.disk_write_bps),
+            net_in_bps = MAX(system_ticks.net_in_bps, excluded.net_in_bps),
+            net_out_bps = MAX(system_ticks.net_out_bps, excluded.net_out_bps),
+            loopback_in_bps = MAX(system_ticks.loopback_in_bps, excluded.loopback_in_bps),
+            loopback_out_bps = MAX(system_ticks.loopback_out_bps, excluded.loopback_out_bps),
+            active_agent_count = MAX(system_ticks.active_agent_count, excluded.active_agent_count),
+            active_agent_summary = CASE
+                WHEN LENGTH(excluded.active_agent_summary) >= LENGTH(system_ticks.active_agent_summary)
+                THEN excluded.active_agent_summary
+                ELSE system_ticks.active_agent_summary
+            END;
 
         DELETE FROM system_ticks
-        WHERE tier = \(fromTier) AND ts < \(cutoff);
-
-        DELETE FROM process_snapshots
-        WHERE ts < \(cutoff) AND (ts % \(bucketSec)) != 0
-          AND ts NOT IN (SELECT (ts / \(bucketSec)) * \(bucketSec) FROM system_ticks WHERE tier = \(toTier));
+        WHERE tier = \(fromTier) AND ts >= \(alignedStart) AND ts < \(alignedCutoff);
         """
         try execRaw(sql)
     }
@@ -379,14 +644,26 @@ public final class FlightboxStore: @unchecked Sendable {
         defer { lock.unlock() }
         guard let db else { return [] }
 
-        let sql = """
-        SELECT ts, tier, cpu_user, cpu_sys, thermal_level, mem_used_bytes, mem_total_bytes,
-               swap_used_bytes, disk_read_bps, disk_write_bps, net_in_bps, net_out_bps,
-               active_agent_count, active_agent_summary
-        FROM system_ticks
-        WHERE ts >= ? AND ts <= ?
-        ORDER BY ts ASC;
-        """
+        let sql: String
+        if hasLoopbackColumns {
+            sql = """
+            SELECT ts, tier, cpu_user, cpu_sys, thermal_level, mem_used_bytes, mem_total_bytes,
+                   swap_used_bytes, disk_read_bps, disk_write_bps, net_in_bps, net_out_bps,
+                   loopback_in_bps, loopback_out_bps, active_agent_count, active_agent_summary
+            FROM system_ticks
+            WHERE ts >= ? AND ts <= ?
+            ORDER BY ts ASC;
+            """
+        } else {
+            sql = """
+            SELECT ts, tier, cpu_user, cpu_sys, thermal_level, mem_used_bytes, mem_total_bytes,
+                   swap_used_bytes, disk_read_bps, disk_write_bps, net_in_bps, net_out_bps,
+                   0, 0, active_agent_count, active_agent_summary
+            FROM system_ticks
+            WHERE ts >= ? AND ts <= ?
+            ORDER BY ts ASC;
+            """
+        }
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let s = stmt else { return [] }
         defer { sqlite3_finalize(s) }
@@ -410,15 +687,21 @@ public final class FlightboxStore: @unchecked Sendable {
                     diskWriteBps: sqlite3_column_int64(s, 9),
                     netInBps: sqlite3_column_int64(s, 10),
                     netOutBps: sqlite3_column_int64(s, 11),
-                    activeAgentCount: Int(sqlite3_column_int(s, 12)),
-                    activeAgentSummary: sqlite3_column_text(s, 13).map { String(cString: $0) } ?? ""
+                    loopbackInBps: sqlite3_column_int64(s, 12),
+                    loopbackOutBps: sqlite3_column_int64(s, 13),
+                    activeAgentCount: Int(sqlite3_column_int(s, 14)),
+                    activeAgentSummary: sqlite3_column_text(s, 15).map { String(cString: $0) } ?? ""
                 )
             )
         }
         return out
     }
 
-    public func queryNearestProcesses(at targetTs: Int64, livePIDs: Set<Int> = []) -> (actualTs: Int64?, processes: [ProcessSample]) {
+    public func queryNearestProcesses(
+        at targetTs: Int64,
+        livePIDs: Set<Int>? = nil,
+        sortBy: ProcessSortOrder = .cpu
+    ) -> (actualTs: Int64?, processes: [ProcessSample]) {
         lock.lock()
         defer { lock.unlock() }
         guard let db else { return (nil, []) }
@@ -441,12 +724,38 @@ public final class FlightboxStore: @unchecked Sendable {
 
         guard let resolvedTs = actualTs else { return (nil, []) }
 
+        let orderClause: String
+        switch sortBy {
+        case .cpu:
+            orderClause = """
+            CASE WHEN cpu_pct >= 0 THEN 0 ELSE 1 END ASC,
+            cpu_pct DESC,
+            rss_bytes DESC,
+            (net_out_bps + net_in_bps) DESC,
+            pid ASC
+            """
+        case .memory:
+            orderClause = """
+            rss_bytes DESC,
+            CASE WHEN cpu_pct >= 0 THEN cpu_pct ELSE 0 END DESC,
+            (net_out_bps + net_in_bps) DESC,
+            pid ASC
+            """
+        case .network:
+            orderClause = """
+            (net_out_bps + net_in_bps) DESC,
+            net_out_bps DESC,
+            rss_bytes DESC,
+            pid ASC
+            """
+        }
+
         let procSQL = """
         SELECT ts, pid, ppid, name, exec_path, bundle_id, signing_team,
                cpu_pct, rss_bytes, disk_read_bps, disk_write_bps, net_in_bps, net_out_bps
         FROM process_snapshots
         WHERE ts = ?
-        ORDER BY (cpu_pct * 25000000.0 + rss_bytes + (net_in_bps + net_out_bps) * 40.0) DESC;
+        ORDER BY \(orderClause);
         """
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, procSQL, -1, &stmt, nil) == SQLITE_OK, let s = stmt else {
@@ -458,7 +767,9 @@ public final class FlightboxStore: @unchecked Sendable {
         var list: [ProcessSample] = []
         while sqlite3_step(s) == SQLITE_ROW {
             let pid = Int(sqlite3_column_int(s, 1))
-            let alive = livePIDs.isEmpty ? true : livePIDs.contains(pid)
+            let alive = livePIDs.map { $0.contains(pid) } ?? true
+            let rawCPU = sqlite3_column_double(s, 7)
+            let cpuReadable = rawCPU >= 0.0
             list.append(
                 ProcessSample(
                     ts: sqlite3_column_int64(s, 0),
@@ -468,13 +779,14 @@ public final class FlightboxStore: @unchecked Sendable {
                     execPath: sqlite3_column_text(s, 4).map { String(cString: $0) } ?? "",
                     bundleID: sqlite3_column_text(s, 5).map { String(cString: $0) },
                     signingTeam: sqlite3_column_text(s, 6).map { String(cString: $0) },
-                    cpuPct: sqlite3_column_double(s, 7),
+                    cpuPct: cpuReadable ? rawCPU : 0.0,
                     rssBytes: sqlite3_column_int64(s, 8),
                     diskReadBps: sqlite3_column_int64(s, 9),
                     diskWriteBps: sqlite3_column_int64(s, 10),
                     netInBps: sqlite3_column_int64(s, 11),
                     netOutBps: sqlite3_column_int64(s, 12),
-                    isAliveNow: alive
+                    isAliveNow: alive,
+                    isCPUReadable: cpuReadable
                 )
             )
         }
@@ -489,21 +801,21 @@ public final class FlightboxStore: @unchecked Sendable {
         let sql: String
         if execPathFilter != nil {
             sql = """
-            SELECT MAX(bucket_hour), exec_path, MAX(process_name), remote_endpoint, MAX(hostname), MAX(proto),
+            SELECT MAX(bucket_hour), exec_path, process_name, remote_endpoint, MAX(hostname), MAX(proto),
                    SUM(total_bytes_in), SUM(total_bytes_out), MIN(first_seen), MAX(last_seen)
             FROM socket_ledger
             WHERE last_seen >= ? AND exec_path = ?
-            GROUP BY exec_path, remote_endpoint
+            GROUP BY exec_path, process_name, remote_endpoint
             ORDER BY (SUM(total_bytes_out) + SUM(total_bytes_in)) DESC
             LIMIT ?;
             """
         } else {
             sql = """
-            SELECT MAX(bucket_hour), exec_path, MAX(process_name), remote_endpoint, MAX(hostname), MAX(proto),
+            SELECT MAX(bucket_hour), exec_path, process_name, remote_endpoint, MAX(hostname), MAX(proto),
                    SUM(total_bytes_in), SUM(total_bytes_out), MIN(first_seen), MAX(last_seen)
             FROM socket_ledger
             WHERE last_seen >= ?
-            GROUP BY exec_path, remote_endpoint
+            GROUP BY exec_path, process_name, remote_endpoint
             ORDER BY (SUM(total_bytes_out) + SUM(total_bytes_in)) DESC
             LIMIT ?;
             """

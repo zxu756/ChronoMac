@@ -1,13 +1,28 @@
 import Foundation
 import SQLite3
 
-/// Read-only bridge that correlates system resource timelines with local AI coding agent sessions
-/// (Claude Code, Codex CLI, OpenCode Desktop, Antigravity) without reading prompt bodies.
+/// Read-only bridge that correlates system resource timelines with local AI coding agent sessions:
+/// - Claude Code (`~/.claude/projects/**/*.jsonl`): reads file creation/modification timestamps and project folder slug only.
+/// - OpenCode (`~/.local/share/opencode/opencode.db`, opened read-only): reads `session.id`, `session.title` (up to 22 chars as timeline label), `time_created`, and `time_updated`.
+/// - Codex CLI (`~/.codex/state_5.sqlite`, opened read-only): reads `threads.id`, `threads.cwd` (last path component as timeline label), `created_at`, and `updated_at`.
+/// Prompt and conversation message bodies are never read.
 public enum AgentActivityBridge {
-    public static func detectLiveAgentSummary(now: Int64 = Int64(Date().timeIntervalSince1970)) -> (count: Int, summary: String, recentWindows: [AgentBurstWindow]) {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        var windows: [AgentBurstWindow] = []
+    public static func detectLiveAgentSummary(
+        now: Int64 = Int64(Date().timeIntervalSince1970),
+        homeDirectory: URL? = nil,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> (count: Int, summary: String, recentWindows: [AgentBurstWindow]) {
+        let home: URL
+        if let explicit = homeDirectory {
+            home = explicit
+        } else if let envHome = environment["CHRONOMAC_AGENT_HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !envHome.isEmpty {
+            home = URL(fileURLWithPath: (envHome as NSString).expandingTildeInPath)
+        } else {
+            home = FileManager.default.homeDirectoryForCurrentUser
+        }
 
+        var windows: [AgentBurstWindow] = []
         windows.append(contentsOf: scanClaudeWindows(home: home, sinceTs: now - 86_400))
         windows.append(contentsOf: scanOpenCodeWindows(home: home, sinceTs: now - 86_400))
         windows.append(contentsOf: scanCodexWindows(home: home, sinceTs: now - 86_400))

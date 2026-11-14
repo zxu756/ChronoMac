@@ -8,11 +8,11 @@ public struct ChronoDashboardView: View {
     @MainActor
     public init(
         monitor: ChronoMonitor,
-        localizer: AppLocalizer = .shared,
+        localizer: AppLocalizer? = nil,
         displayTimeZone: TimeZone = .current
     ) {
         self.monitor = monitor
-        self.localizer = localizer
+        self.localizer = localizer ?? AppLocalizer.shared
         self.displayTimeZone = displayTimeZone
     }
 
@@ -69,19 +69,37 @@ public struct ChronoDashboardView: View {
                     .foregroundStyle(ChronoTheme.chassis)
             }
 
-            HStack(alignment: .firstTextBaseline, spacing: 10) {
+            HStack(alignment: .center, spacing: 8) {
                 Text("ChronoMac")
                     .font(.system(size: 17, weight: .bold))
                     .tracking(-0.3)
                     .foregroundStyle(ChronoTheme.ink)
                     .fixedSize(horizontal: true, vertical: false)
+
+                if monitor.isStaticPreview {
+                    Text(localizer.L("[DEMO]", "[DEMO · 演示数据]"))
+                        .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                        .foregroundStyle(ChronoTheme.cpuAmber)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2.5)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .background(
+                            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                .fill(ChronoTheme.cpuAmber.opacity(0.14))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                .strokeBorder(ChronoTheme.cpuAmber.opacity(0.45), lineWidth: 1)
+                        )
+                }
+
                 Text(
                     localizer.L(
-                        "7-day system flight recorder, DVR timeline & per-process network ledger",
-                        "7 天系统飞行记录仪 · 五轨 DVR 时间轴与进程外联账本"
+                        "Flight recorder (records while open) · DVR & external sockets",
+                        "开启期间录制 · 五轨 DVR 与外部外联账本"
                     )
                 )
-                .font(.system(size: 12.5))
+                .font(.system(size: 12))
                 .tracking(0)
                 .foregroundStyle(ChronoTheme.muted)
                 .lineLimit(1)
@@ -129,7 +147,7 @@ public struct ChronoDashboardView: View {
                     Circle()
                         .fill(ChronoTheme.diskPine)
                         .frame(width: 6.5, height: 6.5)
-                    Text(localizer.L("Recording live (2s WAL)", "实时录制中 (2s WAL)"))
+                    Text(localizer.L("Recording while open (2s WAL)", "开启期间实时录制 (2s WAL)"))
                         .font(.system(size: 11.5, weight: .medium, design: .monospaced))
                         .tracking(0)
                         .foregroundStyle(ChronoTheme.diskPine)
@@ -196,7 +214,7 @@ public struct ChronoDashboardView: View {
                 verticalHairline
                 readoutCell(
                     value: ChronoFormatter.bytes(t?.memUsedBytes ?? 0),
-                    label: localizer.L("Resident RAM & swap", "常驻内存与交换"),
+                    label: localizer.L("Host memory & swap", "主机内存与交换"),
                     detail: localizer.L("Swap: \(swapText)", "交换：\(swapText)"),
                     accent: (t?.swapUsedBytes ?? 0) >= 2_147_483_648 ? ChronoTheme.playheadRed : ChronoTheme.memCobalt
                 )
@@ -210,14 +228,14 @@ public struct ChronoDashboardView: View {
                 verticalHairline
                 readoutCell(
                     value: ChronoFormatter.rate(t?.netOutBps ?? 0),
-                    label: localizer.L("Outbound network", "外联上行网络"),
+                    label: localizer.L("External outbound", "外部上行网络"),
                     detail: localizer.L("Down: \(downText)", "下行：\(downText)"),
                     accent: (t?.netOutBps ?? 0) >= 6_291_456 ? ChronoTheme.playheadRed : ChronoTheme.netPlum
                 )
                 verticalHairline
                 readoutCell(
                     value: localizer.L("\(agentCount) active", "\(agentCount) 个活跃"),
-                    label: localizer.L("AI agent correlation", "AI 编程代理关联"),
+                    label: localizer.L("AI agent metadata", "AI 编程代理会话"),
                     detail: (t?.activeAgentSummary.isEmpty == false)
                         ? (t?.activeAgentSummary ?? "")
                         : localizer.L("Zero active CLI harnesses", "当前无活跃 CLI 代理"),
@@ -287,8 +305,8 @@ public struct ChronoDashboardView: View {
             if monitor.anomalies.isEmpty {
                 Text(
                     localizer.L(
-                        "Zero thermal, swap, or outbound network anomalies in selected window",
-                        "所选时间窗口内无温控、交换或外联网络异常"
+                        "Zero thermal, swap, or external outbound network anomalies in selected window",
+                        "所选时间窗口内无温控、交换或外部网络上行异常"
                     )
                 )
                 .font(.system(size: 11.5))
@@ -333,7 +351,7 @@ public struct ChronoDashboardView: View {
         .background(ChronoTheme.band)
     }
 
-    // MARK: - Bottom Split Deck: Historical Process Blame (Left) + Outbound Socket Ledger (Right)
+    // MARK: - Bottom Split Deck: Historical Process Blame (Left) + External Socket Ledger (Right)
 
     private var forensicSplitDeck: some View {
         HStack(spacing: 0) {
@@ -345,72 +363,100 @@ public struct ChronoDashboardView: View {
                 .frame(width: 1)
 
             outboundSocketPane
-                .frame(width: 368)
+                .frame(width: 348)
                 .frame(maxHeight: .infinity)
         }
         .background(ChronoTheme.viewport)
     }
 
+    private var snapshotTitleText: String {
+        guard let ts = monitor.displayedSnapshotTs else {
+            return localizer.L("Live process snapshot", "实时进程快照")
+        }
+        let clock = ChronoFormatter.clockTime(ts, timeZone: displayTimeZone)
+        if let requested = monitor.scrubbedTimestamp {
+            let delta = abs(ts - requested)
+            return localizer.L(
+                "Snapshot at \(clock) (\(delta)s from requested time)",
+                "取自 \(clock) 的快照（距所查时刻差 \(delta) 秒）"
+            )
+        }
+        return localizer.L("Live process snapshot @ \(clock)", "实时进程快照 @ \(clock)")
+    }
+
     private var processBlamePane: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text(
-                    monitor.displayedSnapshotTs.map { ts in
-                        let clock = ChronoFormatter.clockTime(ts, timeZone: displayTimeZone)
-                        return localizer.L(
-                            "Process blame snapshot @ \(clock)",
-                            "历史进程追责快照 @ \(clock)"
-                        )
-                    } ?? localizer.L("Live process snapshot", "实时进程快照")
-                )
-                .font(.system(size: 12, weight: .bold))
-                .tracking(0)
-                .foregroundStyle(ChronoTheme.ink)
+            HStack(spacing: 8) {
+                Text(snapshotTitleText)
+                    .font(.system(size: 11.5, weight: .bold))
+                    .tracking(0)
+                    .foregroundStyle(ChronoTheme.ink)
+                    .lineLimit(1)
 
-                Spacer()
+                Spacer(minLength: 6)
 
                 if monitor.selectedProcessExecPath != nil {
                     Button(action: { monitor.selectedProcessExecPath = nil }) {
-                        Text(localizer.L("Clear socket filter", "清除外联筛选"))
-                            .font(.system(size: 11, weight: .medium))
+                        Text(localizer.L("Clear filter", "清除筛选"))
+                            .font(.system(size: 10.5, weight: .medium))
                             .tracking(0)
                             .foregroundStyle(ChronoTheme.memCobalt)
+                            .fixedSize(horizontal: true, vertical: false)
                     }
                     .buttonStyle(.plain)
-                } else {
-                    Text(
-                        localizer.L(
-                            "Click any process to filter remote sockets",
-                            "点击任意进程以筛选远程外联连接"
-                        )
-                    )
-                    .font(.system(size: 11))
-                    .tracking(0)
-                    .foregroundStyle(ChronoTheme.subtle)
                 }
+
+                // Explicit 3-Mode Ranking Selector (By CPU / By Memory / By Network)
+                HStack(spacing: 2) {
+                    ForEach(ProcessSortOrder.allCases) { mode in
+                        let active = monitor.selectedSortOrder == mode
+                        Button(action: { monitor.selectedSortOrder = mode }) {
+                            Text(mode.label(in: localizer.language))
+                                .font(.system(size: 10.5, weight: active ? .semibold : .regular))
+                                .tracking(0)
+                                .foregroundStyle(active ? ChronoTheme.ink : ChronoTheme.muted)
+                                .padding(.horizontal, 7.5)
+                                .padding(.vertical, 3)
+                                .fixedSize(horizontal: true, vertical: false)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                        .fill(active ? ChronoTheme.viewport : Color.clear)
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                        .strokeBorder(active ? ChronoTheme.hairline : Color.clear, lineWidth: 1)
+                                )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(2)
+                .fixedSize(horizontal: true, vertical: false)
+                .background(RoundedRectangle(cornerRadius: 6.5, style: .continuous).fill(ChronoTheme.well))
             }
             .padding(.horizontal, 18)
-            .padding(.vertical, 8.5)
+            .padding(.vertical, 7.5)
             .background(ChronoTheme.band)
 
             Rectangle().fill(ChronoTheme.rowRule).frame(height: 1)
 
             // Column Header
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 Text(localizer.L("Process & binary path", "进程与可执行路径"))
                     .frame(maxWidth: .infinity, alignment: .leading)
-                Text(localizer.L("PID / State", "PID / 状态"))
-                    .frame(width: 96, alignment: .leading)
+                Text(localizer.L("PID / Status", "PID / 状态"))
+                    .frame(width: 108, alignment: .leading)
                 Text(localizer.L("CPU", "CPU"))
-                    .frame(width: 54, alignment: .trailing)
-                Text(localizer.L("Memory", "常驻内存"))
-                    .frame(width: 72, alignment: .trailing)
+                    .frame(width: 92, alignment: .trailing)
+                Text(localizer.L("Memory Footprint (phys_footprint)", "物理内存占用 (phys_footprint)"))
+                    .frame(width: 184, alignment: .trailing)
+                    .fixedSize(horizontal: true, vertical: false)
                 Text(localizer.L("Net out", "外联上行"))
-                    .frame(width: 76, alignment: .trailing)
+                    .frame(width: 72, alignment: .trailing)
                 Text(localizer.L("Action", "操作"))
-                    .frame(width: 62, alignment: .trailing)
+                    .frame(width: 56, alignment: .trailing)
             }
-            .font(.system(size: 10.5, weight: .semibold))
+            .font(.system(size: 10, weight: .semibold))
             .tracking(0)
             .foregroundStyle(ChronoTheme.muted)
             .padding(.horizontal, 18)
@@ -441,74 +487,79 @@ public struct ChronoDashboardView: View {
     }
 
     private func processRow(_ p: ProcessSample) -> some View {
-        let selected = monitor.selectedProcessExecPath == p.execPath
-        let hot = p.cpuPct >= 150 || p.rssBytes >= 4_294_967_296 || p.netOutBps >= 5_242_880
+        let selected = !p.execPath.isEmpty && monitor.selectedProcessExecPath == p.execPath
+        let hot = (p.isCPUReadable && p.cpuPct >= 150) || p.rssBytes >= 4_294_967_296 || p.netOutBps >= 5_242_880
+        let displayedPath = p.execPath.isEmpty
+            ? localizer.L("(path unavailable)", "（路径不可用）")
+            : ChronoFormatter.displayPath(p.execPath)
 
         return Button(action: {
+            guard !p.execPath.isEmpty else { return }
             monitor.selectedProcessExecPath = (selected ? nil : p.execPath)
         }) {
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
                         Circle()
                             .fill(hot ? ChronoTheme.playheadRed : (p.isAliveNow ? ChronoTheme.diskPine : ChronoTheme.subtle))
                             .frame(width: 6.5, height: 6.5)
                         Text(p.name)
-                            .font(.system(size: 12.5, weight: .semibold))
+                            .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(ChronoTheme.ink)
                             .lineLimit(1)
                     }
-                    Text(ChronoFormatter.displayPath(p.execPath))
-                        .font(.system(size: 10.5, design: .monospaced))
-                        .foregroundStyle(ChronoTheme.muted)
+                    Text(displayedPath)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(p.execPath.isEmpty ? ChronoTheme.subtle : ChronoTheme.muted)
                         .lineLimit(1)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(verbatim: "PID \(p.pid)")
-                        .font(.system(size: 11.5, weight: .medium, design: .monospaced))
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
                         .foregroundStyle(ChronoTheme.ink)
                     if !p.isAliveNow {
-                        Text(localizer.L("Exited after spike", "峰值后已退出"))
+                        Text(localizer.L("exited after spike", "尖峰后已退出"))
                             .font(.system(size: 9.5, weight: .semibold))
                             .tracking(0)
                             .foregroundStyle(ChronoTheme.playheadRed)
                             .fixedSize(horizontal: true, vertical: false)
-                    } else if let team = p.signingTeam {
-                        Text(verbatim: team == "Apple" ? localizer.L("Apple", "Apple 系统") : team)
-                            .font(.system(size: 9.5, design: .monospaced))
+                    } else {
+                        Text(localizer.L("still running", "仍在运行"))
+                            .font(.system(size: 9.5, weight: .medium))
                             .tracking(0)
-                            .foregroundStyle(ChronoTheme.subtle)
+                            .foregroundStyle(ChronoTheme.diskPine)
                             .fixedSize(horizontal: true, vertical: false)
                     }
                 }
-                .frame(width: 96, alignment: .leading)
+                .frame(width: 108, alignment: .leading)
 
-                Text(String(format: "%.1f%%", p.cpuPct))
-                    .font(.system(size: 12, weight: p.cpuPct >= 100 ? .bold : .medium, design: .monospaced))
-                    .foregroundStyle(p.cpuPct >= 150 ? ChronoTheme.cpuAmber : ChronoTheme.ink)
-                    .frame(width: 54, alignment: .trailing)
+                Text(p.formattedCPU(in: localizer.language))
+                    .font(.system(size: p.isCPUReadable ? 11.5 : 10, weight: (p.isCPUReadable && p.cpuPct >= 100) ? .bold : .medium, design: .monospaced))
+                    .foregroundStyle(!p.isCPUReadable ? ChronoTheme.subtle : (p.cpuPct >= 150 ? ChronoTheme.cpuAmber : ChronoTheme.ink))
+                    .frame(width: 92, alignment: .trailing)
+                    .fixedSize(horizontal: false, vertical: true)
 
-                Text(ChronoFormatter.bytes(p.rssBytes))
-                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                Text(p.rssBytes > 0 || p.isCPUReadable ? ChronoFormatter.bytes(p.memoryFootprintBytes) : "—")
+                    .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
                     .foregroundStyle(p.rssBytes >= 4_294_967_296 ? ChronoTheme.playheadRed : ChronoTheme.ink)
-                    .frame(width: 72, alignment: .trailing)
+                    .frame(width: 184, alignment: .trailing)
 
                 Text(ChronoFormatter.rate(p.netOutBps))
-                    .font(.system(size: 11.5, weight: p.netOutBps >= 5_242_880 ? .bold : .regular, design: .monospaced))
+                    .font(.system(size: 11, weight: p.netOutBps >= 5_242_880 ? .bold : .regular, design: .monospaced))
                     .foregroundStyle(p.netOutBps >= 5_242_880 ? ChronoTheme.netPlum : ChronoTheme.muted)
-                    .frame(width: 76, alignment: .trailing)
+                    .frame(width: 72, alignment: .trailing)
 
                 HStack {
                     Spacer()
-                    if p.isAliveNow && p.pid > 1 && p.signingTeam != "Apple" {
+                    if p.isAliveNow && p.pid > 1 && p.signingTeam != "Apple" && p.isCPUReadable {
                         Button(action: { monitor.terminateProcess(p) }) {
                             Text(localizer.L("Stop", "终止"))
-                                .font(.system(size: 10.5, weight: .semibold))
+                                .font(.system(size: 10, weight: .semibold))
                                 .tracking(0)
                                 .foregroundStyle(ChronoTheme.playheadRed)
-                                .padding(.horizontal, 9)
+                                .padding(.horizontal, 8)
                                 .padding(.vertical, 3)
                                 .fixedSize(horizontal: true, vertical: false)
                                 .background(RoundedRectangle(cornerRadius: 5).fill(ChronoTheme.playheadRed.opacity(0.09)))
@@ -516,23 +567,23 @@ public struct ChronoDashboardView: View {
                         }
                         .buttonStyle(.plain)
                     } else {
-                        Text(p.isAliveNow ? localizer.L("System", "系统") : localizer.L("Recorded", "已归档"))
-                            .font(.system(size: 10.5))
+                        Text(p.isAliveNow ? localizer.L("System", "系统") : localizer.L("Archived", "已归档"))
+                            .font(.system(size: 10))
                             .tracking(0)
                             .foregroundStyle(ChronoTheme.subtle)
                             .fixedSize(horizontal: true, vertical: false)
                     }
                 }
-                .frame(width: 62, alignment: .trailing)
+                .frame(width: 56, alignment: .trailing)
             }
             .padding(.horizontal, 18)
-            .padding(.vertical, 8.5)
+            .padding(.vertical, 6.5)
             .background(selected ? ChronoTheme.memCobalt.opacity(0.07) : ChronoTheme.viewport)
         }
         .buttonStyle(.plain)
     }
 
-    // MARK: - Right Pane: Process Outbound Socket & Remote Host Ledger
+    // MARK: - Right Pane: Process External Socket & Remote Host Ledger
 
     private var outboundSocketPane: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -542,8 +593,8 @@ public struct ChronoDashboardView: View {
                     .tracking(0)
                     .foregroundStyle(ChronoTheme.ink)
                 Spacer()
-                Text(localizer.L("Bytes up / down", "累计上行 / 下行"))
-                    .font(.system(size: 10.5, design: .monospaced))
+                Text(localizer.L("Loopback excluded", "不含本机回环"))
+                    .font(.system(size: 10, design: .monospaced))
                     .tracking(0)
                     .foregroundStyle(ChronoTheme.subtle)
             }
@@ -561,8 +612,8 @@ public struct ChronoDashboardView: View {
                         .foregroundStyle(ChronoTheme.ink)
                     Text(
                         localizer.L(
-                            "Loopback 127.0.0.1 traffic is excluded automatically.",
-                            "本地回环 127.0.0.1 流量已自动排除。"
+                            "Loopback (127.0.0.1 / ::1 / lo0) traffic is tracked separately.",
+                            "本地回环 (127.0.0.1 / ::1 / lo0) 流量已独立隔离。"
                         )
                     )
                     .font(.system(size: 11))
@@ -572,7 +623,7 @@ public struct ChronoDashboardView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if monitor.isStaticPreview {
                 VStack(spacing: 0) {
-                    ForEach(monitor.socketFlows.prefix(5)) { flow in
+                    ForEach(monitor.socketFlows.prefix(4)) { flow in
                         socketFlowRow(flow)
                         Rectangle().fill(ChronoTheme.rowRule).frame(height: 1)
                     }
@@ -596,28 +647,28 @@ public struct ChronoDashboardView: View {
         return VStack(alignment: .leading, spacing: 3) {
             HStack(alignment: .firstTextBaseline) {
                 Text(flow.hostname ?? flow.remoteEndpoint)
-                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                    .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
                     .foregroundStyle(heavyUp ? ChronoTheme.playheadRed : ChronoTheme.ink)
                     .lineLimit(1)
                 Spacer()
                 Text("↑ \(ChronoFormatter.bytes(flow.totalBytesOut))")
-                    .font(.system(size: 11.5, weight: .bold, design: .monospaced))
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
                     .foregroundStyle(heavyUp ? ChronoTheme.playheadRed : ChronoTheme.netPlum)
             }
 
             HStack {
                 Text("\(flow.processName) · \(flow.remoteEndpoint)")
-                    .font(.system(size: 10.5, design: .monospaced))
+                    .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(ChronoTheme.muted)
                     .lineLimit(1)
                 Spacer()
                 Text("↓ \(ChronoFormatter.bytes(flow.totalBytesIn))")
-                    .font(.system(size: 10.5, design: .monospaced))
+                    .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(ChronoTheme.subtle)
             }
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 9.5)
+        .padding(.vertical, 9)
         .background(heavyUp ? ChronoTheme.playheadRed.opacity(0.04) : ChronoTheme.viewport)
     }
 }

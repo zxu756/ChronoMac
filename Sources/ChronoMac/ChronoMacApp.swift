@@ -29,7 +29,8 @@ struct ChronoMacApp: App {
 
         if args.contains("--mcp") {
             do {
-                let store = try FlightboxStore()
+                let dbURL = FlightboxStore.resolveDatabaseURL(arguments: args)
+                let store = try FlightboxStore(databaseURL: dbURL, readOnly: true)
                 ChronoMCPServer(store: store).runStdioLoop()
                 exit(0)
             } catch {
@@ -38,14 +39,20 @@ struct ChronoMacApp: App {
             }
         }
 
-        if let idx = args.firstIndex(of: "--cli") {
-            let subcmd = (idx + 1 < args.count) ? args[idx + 1] : "status"
-            Self.runHeadlessCLI(subcmd: subcmd, allArgs: args)
-            exit(0)
+        if args.contains("--cli") {
+            let exitCode = ChronoCLIRunner.run(arguments: args)
+            exit(exitCode)
         }
 
+        let isDemoMode = args.contains("--demo")
         _localizer = StateObject(wrappedValue: AppLocalizer.shared)
-        _monitor = StateObject(wrappedValue: ChronoMonitor())
+        if isDemoMode {
+            _monitor = StateObject(wrappedValue: ChronoMonitor.preview())
+        } else {
+            let dbURL = FlightboxStore.resolveDatabaseURL(arguments: args)
+            let customStore = try? FlightboxStore(databaseURL: dbURL)
+            _monitor = StateObject(wrappedValue: ChronoMonitor(store: customStore))
+        }
     }
 
     var body: some Scene {
@@ -98,50 +105,5 @@ struct ChronoMacApp: App {
             }
         }
         .menuBarExtraStyle(.window)
-    }
-
-    private static func runHeadlessCLI(subcmd: String, allArgs: [String]) {
-        guard let store = try? FlightboxStore() else {
-            fputs("Could not open ChronoMac SQLite flightbox.\n", stderr)
-            exit(1)
-        }
-        let server = ChronoMCPServer(store: store)
-        switch subcmd {
-        case "anomalies":
-            let req = #"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"chrono_summary_window","arguments":{"minutes":360}}}"#
-            if let out = server.handleJSONRPCLine(req) { print(out) }
-        case "blame":
-            var minutesAgo = 10
-            if let atIdx = allArgs.firstIndex(of: "--at"), atIdx + 1 < allArgs.count {
-                let token = allArgs[atIdx + 1].lowercased()
-                let digits = token.filter(\.isNumber)
-                if let parsed = Int(digits) {
-                    minutesAgo = token.contains("h") ? parsed * 60 : parsed
-                }
-            }
-            let req = #"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"chrono_inspect_timestamp","arguments":{"minutes_ago":\#(minutesAgo)}}}"#
-            if let out = server.handleJSONRPCLine(req) { print(out) }
-        case "egress":
-            let req = #"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"chrono_top_egress_endpoints","arguments":{"hours":24}}}"#
-            if let out = server.handleJSONRPCLine(req) { print(out) }
-        case "record-once":
-            let host = MachSystemSampler()
-            let state = host.sampleHostState()
-            print(
-                String(
-                    format: "Live Host | CPU: %.1f%% | RAM: %@ / %@ | Swap: %@ | Thermal: %@",
-                    state.cpuUserPct + state.cpuSysPct,
-                    ChronoFormatter.bytes(state.memUsedBytes),
-                    ChronoFormatter.bytes(host.totalMemoryBytes),
-                    ChronoFormatter.bytes(state.swapUsedBytes),
-                    state.thermal.label
-                )
-            )
-        default:
-            let now = Int64(Date().timeIntervalSince1970)
-            let ticks = store.queryTicks(from: now - 3600, to: now)
-            print("ChronoMac Flightbox: \(store.dbPath) (\(ticks.count) samples in last 1h)")
-            Self.runHeadlessCLI(subcmd: "record-once", allArgs: allArgs)
-        }
     }
 }

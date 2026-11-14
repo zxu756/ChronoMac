@@ -1,0 +1,90 @@
+========================================================================
+ChronoMac M0 Acceptance Suite (Isolated Temp Dir: /var/folders/d5/4h6nzhm94l91870kmn7p8q040000gn/T//chronomac-m0-acc.ApVxNQ)
+========================================================================
+
+[Row 1/6] 30-hour synthetic stream (90 spikes every 20m, compaction every 60s)...
+Building for debugging...
+Build complete! (0.42秒)
+◇ Test run started.
+↳ Testing Library Version: 2403
+↳ Target Platform: arm64e-apple-macos14.0
+◇ Suite "Store Tests" started.
+◇ Test "T1 Acceptance Row 1: 30-hour synthetic stream (90 spikes every 20m, compaction every 60s) preserves all 90 spikes" started.
+✔ Test "T1 Acceptance Row 1: 30-hour synthetic stream (90 spikes every 20m, compaction every 60s) preserves all 90 spikes" passed after 3.415 seconds.
+✔ Suite "Store Tests" passed after 3.415 seconds.
+✔ Test run with 1 test in 1 suite passed after 3.415 seconds.
+  -> SQLite verification: surviving_spikes=90 / 90 across 9240 compacted/raw rows
+  -> PASS [Row 1]: 90 / 90 spikes preserved.
+
+[Row 2/6] 2 MB hard cap with 10 MB of <48h data (including -wal & -shm)...
+Building for debugging...
+Build complete! (0.19秒)
+◇ Test run started.
+↳ Testing Library Version: 2403
+↳ Target Platform: arm64e-apple-macos14.0
+◇ Suite "Store Tests" started.
+◇ Test "T2 Acceptance Row 2: 2 MB storage cap trims 10 MB of <48h data including WAL and reclaims free pages" started.
+✔ Test "T2 Acceptance Row 2: 2 MB storage cap trims 10 MB of <48h data including WAL and reclaims free pages" passed after 0.593 seconds.
+✔ Suite "Store Tests" passed after 0.593 seconds.
+✔ Test run with 1 test in 1 suite passed after 0.593 seconds.
+  -> Disk bytes after retention: db=2023424 wal=0 shm=32768 total=2056192 (cap=2097152, freelist_count=0)
+  -> PASS [Row 2]: Total storage (2056192 B) <= 2 MB (2097152 B).
+
+[Row 3/6] Live recording session with 200 MB TCP 127.0.0.1 loopback transfer...
+Building for debugging...
+Build complete! (0.20秒)
+◇ Test run started.
+↳ Testing Library Version: 2403
+↳ Target Platform: arm64e-apple-macos14.0
+◇ Suite "Sampler Tests" started.
+◇ Test "T3 Acceptance Row 3: Live recording session during 200 MB TCP 127.0.0.1 transfer between two local processes leaves external totals untouched and triggers 0 anomalies" started.
+✔ Test "T3 Acceptance Row 3: Live recording session during 200 MB TCP 127.0.0.1 transfer between two local processes leaves external totals untouched and triggers 0 anomalies" passed after 1.928 seconds.
+✔ Suite "Sampler Tests" passed after 1.928 seconds.
+✔ Test run with 1 test in 1 suite passed after 1.929 seconds.
+  -> SQLite verification: peak_loopback_out_bps=223309140 ext_out_delta_bps=464170 loopback_rows_in_socket_ledger=0 net_anomalies=0
+  -> CLI anomalies (EN): No anomaly bookmarks recorded in this window.
+  -> CLI anomalies (ZH): 窗口内未检测到异常书签。
+  -> PASS [Row 3]: External inbound/outbound untouched by 200 MB loopback; 0 network anomalies.
+
+[Row 4/6] 5 consecutive runs of ChronoMac --cli status vs live top (in --lang en and --lang zh)...
+  -- Language: en --
+    Run 1 (en): ChronoMac=28.1% | top=30.5% | diff=2.4 pp -> OK
+    Run 2 (en): ChronoMac=13.4% | top=13.6% | diff=0.2 pp -> OK
+    Run 3 (en): ChronoMac=16.6% | top=16.8% | diff=0.2 pp -> OK
+    Run 4 (en): ChronoMac=12.9% | top=13.4% | diff=0.5 pp -> OK
+    Run 5 (en): ChronoMac=16.3% | top=16.5% | diff=0.2 pp -> OK
+  -- Language: zh --
+    Run 1 (zh): ChronoMac=27.6% | top=28.1% | diff=0.5 pp -> OK
+    Run 2 (zh): ChronoMac=28.7% | top=30.4% | diff=1.7 pp -> OK
+    Run 3 (zh): ChronoMac=25.4% | top=25.2% | diff=0.2 pp -> OK
+    Run 4 (zh): ChronoMac=12.9% | top=14.8% | diff=1.9 pp -> OK
+    Run 5 (zh): ChronoMac=12.6% | top=13.3% | diff=0.7 pp -> OK
+  -> PASS [Row 4]: All 10 calibrated runs (5 EN + 5 ZH) > 0.0% and within <= 10.0 pp of top.
+
+[Row 5/6] Unknown subcommand 'ChronoMac --cli bogus' returns exit code 2 (EN & ZH)...
+  -> --lang en: exit_code=2 stderr="Error: Unknown CLI subcommand 'bogus'. Supported subcommands: status, blame, anomalies, egress (use --help for usage)."
+  -> --lang zh: exit_code=2 stderr="错误：未知 CLI 子命令 'bogus'。支持的子命令：status、blame、anomalies、egress（使用 --help 查看用法）。"
+  -> PASS [Row 5]: Exit code 2 verified in both EN and ZH.
+
+[Row 6/6] Running mutation-sensitive CPU, Memory Footprint, and Storage Cap test guards...
+Building for debugging...
+Build complete! (0.19秒)
+◇ Test run started.
+↳ Testing Library Version: 2403
+↳ Target Platform: arm64e-apple-macos14.0
+◇ Suite "Sampler Tests" started.
+◇ Test "T7 & T10: Real ProcessTreeSampler measures non-zero CPU & memory footprint on current process and surfaces EPERM processes as No permission" started.
+✔ Test "T7 & T10: Real ProcessTreeSampler measures non-zero CPU & memory footprint on current process and surfaces EPERM processes as No permission" passed after 0.530 seconds.
+✔ Suite "Sampler Tests" passed after 0.531 seconds.
+◇ Suite "Store Tests" started.
+◇ Test "T2 Acceptance Row 2: 2 MB storage cap trims 10 MB of <48h data including WAL and reclaims free pages" started.
+✔ Test "T2 Acceptance Row 2: 2 MB storage cap trims 10 MB of <48h data including WAL and reclaims free pages" passed after 0.639 seconds.
+✔ Suite "Store Tests" passed after 0.639 seconds.
+✔ Test run with 2 tests in 2 suites passed after 1.171 seconds.
+  -> PASS [Row 6]: Guard tests active and passing (3 live RED->GREEN mutations verified).
+
+[DB Safety] Verified ~/Library/Application Support/ChronoMac/flightbox.sqlite untouched (SHA-256: f87d4c0ee94513212d3cd18247ced963c58959a51221d46e88b42e7831d8ba43).
+
+========================================================================
+ALL 6 M0 ACCEPTANCE ROWS PASSED
+========================================================================

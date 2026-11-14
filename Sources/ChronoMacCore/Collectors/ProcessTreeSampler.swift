@@ -15,11 +15,83 @@ public final class ProcessTreeSampler: @unchecked Sendable {
         var teamID: String?
     }
 
+    private static let notableSystemDaemons: Set<String> = [
+        "WindowServer", "kernel_task", "launchd", "mds_stores", "mds", "backupd", "coreaudiod"
+    ]
+
     private var prevByPID: [Int: PrevUsage] = [:]
     private var signingCache: [String: SigningMeta] = [:]
     private let lock = NSLock()
 
     public init() {}
+
+    /// Enumerates all live PIDs across the system via `sysctl(CTL_KERN, KERN_PROC, KERN_PROC_ALL)`,
+    /// including root/system processes (`kernel_task`, `launchd`, `WindowServer`) that `proc_listallpids` omits.
+    public static func currentLivePIDs() -> Set<Int> {
+        let entries = enumerateAllKernelProcesses()
+        if !entries.isEmpty {
+            return Set(entries.map(\.pid))
+        }
+        let countGuess = proc_listallpids(nil, 0)
+        let cap = max(512, Int(countGuess) + 128)
+        var pids = [pid_t](repeating: 0, count: cap)
+        let byteLen = Int32(cap * MemoryLayout<pid_t>.size)
+        let actualBytes = proc_listallpids(&pids, byteLen)
+        let pidCount = max(0, Int(actualBytes) / MemoryLayout<pid_t>.size)
+        var out = Set<Int>()
+        for i in 0..<pidCount where pids[i] >= 0 {
+            out.insert(Int(pids[i]))
+        }
+        return out
+    }
+
+    /// Resolves full executable path via `proc_pidpath`, returning `""` (empty string) when unavailable.
+    /// Never substitutes a bare process name (`p_comm` / `pbi_comm`) into `execPath`.
+    public static func resolveExecutablePath(pid: Int) -> String {
+        guard pid > 0 else { return "" }
+        var pathBuf = [CChar](repeating: 0, count: Int(MAXPATHLEN) * 4)
+        let pathLen = proc_pidpath(pid_t(pid), &pathBuf, UInt32(pathBuf.count))
+        guard pathLen > 0 else { return "" }
+        let resolved = String(cString: pathBuf).trimmingCharacters(in: .whitespacesAndNewlines)
+        return resolved.hasPrefix("/") ? resolved : ""
+    }
+
+    private struct KernelProcEntry {
+        var pid: Int
+        var ppid: Int
+        var uid: uid_t
+        var comm: String
+    }
+
+    private static func enumerateAllKernelProcesses() -> [KernelProcEntry] {
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0]
+        var size: Int = 0
+        guard sysctl(&mib, 4, nil, &size, nil, 0) == 0, size > 0 else {
+            return []
+        }
+        let estimatedCount = size / MemoryLayout<kinfo_proc>.stride + 64
+        var procs = [kinfo_proc](repeating: kinfo_proc(), count: estimatedCount)
+        var actualSize = procs.count * MemoryLayout<kinfo_proc>.stride
+        guard sysctl(&mib, 4, &procs, &actualSize, nil, 0) == 0 else {
+            return []
+        }
+        let actualCount = actualSize / MemoryLayout<kinfo_proc>.stride
+        var seen = Set<Int>()
+        var entries: [KernelProcEntry] = []
+        entries.reserveCapacity(actualCount)
+
+        for idx in 0..<actualCount {
+            let pid = Int(procs[idx].kp_proc.p_pid)
+            guard pid >= 0, seen.insert(pid).inserted else { continue }
+            let ppid = Int(procs[idx].kp_eproc.e_ppid)
+            let uid = procs[idx].kp_eproc.e_ucred.cr_uid
+            let comm = withUnsafePointer(to: procs[idx].kp_proc.p_comm) {
+                $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXCOMLEN) + 1) { String(cString: $0) }
+            }
+            entries.append(KernelProcEntry(pid: pid, ppid: ppid, uid: uid, comm: comm))
+        }
+        return entries
+    }
 
     public func sampleTopProcesses(
         ts: Int64,
@@ -28,19 +100,15 @@ public final class ProcessTreeSampler: @unchecked Sendable {
         limit: Int = 30
     ) -> (processes: [ProcessSample], totalDiskReadBps: Int64, totalDiskWriteBps: Int64, livePIDs: Set<Int>) {
         let now = Date().timeIntervalSince1970
-        let countGuess = proc_listallpids(nil, 0)
-        let cap = max(512, Int(countGuess) + 128)
-        var pids = [pid_t](repeating: 0, count: cap)
-        let byteLen = Int32(cap * MemoryLayout<pid_t>.size)
-        let actualBytes = proc_listallpids(&pids, byteLen)
-        let pidCount = max(0, Int(actualBytes) / MemoryLayout<pid_t>.size)
+        let kernelEntries = Self.enumerateAllKernelProcesses()
 
         lock.lock()
         defer { lock.unlock() }
 
         var aliveSet = Set<Int>()
         var nextPrev: [Int: PrevUsage] = [:]
-        var samples: [ProcessSample] = []
+        var readableCandidates: [ProcessSample] = []
+        var unreadableCandidates: [ProcessSample] = []
         var hostDiskReadBps: Int64 = 0
         var hostDiskWriteBps: Int64 = 0
 
@@ -49,63 +117,94 @@ public final class ProcessTreeSampler: @unchecked Sendable {
         let numer = UInt64(max(1, timebase.numer))
         let denom = UInt64(max(1, timebase.denom))
 
-        for i in 0..<pidCount {
-            let pid = Int(pids[i])
-            if pid <= 0 { continue }
+        for entry in kernelEntries {
+            let pid = entry.pid
             aliveSet.insert(pid)
 
-            var bsd = proc_bsdinfo()
-            let bsdLen = proc_pidinfo(pid_t(pid), PROC_PIDTBSDINFO, 0, &bsd, Int32(MemoryLayout<proc_bsdinfo>.size))
-            guard bsdLen == Int32(MemoryLayout<proc_bsdinfo>.size) else { continue }
+            var ppid = entry.ppid
+            var fallbackName = entry.comm
 
-            var pathBuf = [CChar](repeating: 0, count: Int(MAXPATHLEN) * 4)
-            let pathLen = proc_pidpath(pid_t(pid), &pathBuf, UInt32(pathBuf.count))
-            let commName = withUnsafePointer(to: bsd.pbi_comm) {
-                $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXCOMLEN)) { String(cString: $0) }
-            }
-            let execPath = pathLen > 0 ? String(cString: pathBuf) : commName
-            let displayName = pathLen > 0 ? URL(fileURLWithPath: execPath).lastPathComponent : commName
-
-            var ru = rusage_info_v4()
-            let rkr = withUnsafeMutablePointer(to: &ru) {
-                $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { ptr in
-                    proc_pid_rusage(pid_t(pid), RUSAGE_INFO_V4, ptr)
+            if pid > 0 {
+                var bsd = proc_bsdinfo()
+                let bsdLen = proc_pidinfo(pid_t(pid), PROC_PIDTBSDINFO, 0, &bsd, Int32(MemoryLayout<proc_bsdinfo>.size))
+                if bsdLen == Int32(MemoryLayout<proc_bsdinfo>.size) {
+                    ppid = Int(bsd.pbi_ppid)
+                    let fullBsdName = withUnsafePointer(to: bsd.pbi_name) {
+                        $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXCOMLEN) * 2) { String(cString: $0) }
+                    }
+                    let shortComm = withUnsafePointer(to: bsd.pbi_comm) {
+                        $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXCOMLEN)) { String(cString: $0) }
+                    }
+                    if !fullBsdName.isEmpty {
+                        fallbackName = fullBsdName
+                    } else if !shortComm.isEmpty {
+                        fallbackName = shortComm
+                    }
                 }
+            } else {
+                fallbackName = "kernel_task"
             }
 
-            var rssBytes: Int64 = 0
+            let execPath = Self.resolveExecutablePath(pid: pid)
+            let displayName: String
+            if !execPath.isEmpty {
+                let last = URL(fileURLWithPath: execPath).lastPathComponent
+                displayName = last.isEmpty ? fallbackName : last
+            } else {
+                displayName = fallbackName.isEmpty ? "pid-\(pid)" : fallbackName
+            }
+
+            var footprintBytes: Int64 = 0
             var cpuPct: Double = 0
             var dReadBps: Int64 = 0
             var dWriteBps: Int64 = 0
+            var isCPUReadable = true
 
-            if rkr == 0 {
-                rssBytes = Int64(ru.ri_phys_footprint > 0 ? ru.ri_phys_footprint : ru.ri_resident_size)
-                let totalMachTicks = ru.ri_user_time &+ ru.ri_system_time
-                let cpuNs = (totalMachTicks &* numer) / denom
-
-                if let prev = prevByPID[pid] {
-                    let dt = max(0.25, now - prev.sampledAt)
-                    if cpuNs >= prev.cpuTotalNs {
-                        let deltaSec = Double(cpuNs - prev.cpuTotalNs) / 1_000_000_000.0
-                        cpuPct = (deltaSec / dt) * 100.0
-                    }
-                    if ru.ri_diskio_bytesread >= prev.diskRead {
-                        dReadBps = Int64(Double(ru.ri_diskio_bytesread - prev.diskRead) / dt)
-                    }
-                    if ru.ri_diskio_byteswritten >= prev.diskWrite {
-                        dWriteBps = Int64(Double(ru.ri_diskio_byteswritten - prev.diskWrite) / dt)
+            if pid == 0 {
+                isCPUReadable = false
+            } else {
+                errno = 0
+                var ru = rusage_info_v4()
+                let rkr = withUnsafeMutablePointer(to: &ru) {
+                    $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { ptr in
+                        proc_pid_rusage(pid_t(pid), RUSAGE_INFO_V4, ptr)
                     }
                 }
-                nextPrev[pid] = PrevUsage(
-                    cpuTotalNs: cpuNs,
-                    diskRead: ru.ri_diskio_bytesread,
-                    diskWrite: ru.ri_diskio_byteswritten,
-                    sampledAt: now
-                )
-            } else {
-                var ti = proc_taskinfo()
-                if proc_pidinfo(pid_t(pid), PROC_PIDTASKINFO, 0, &ti, Int32(MemoryLayout<proc_taskinfo>.size)) > 0 {
-                    rssBytes = Int64(ti.pti_resident_size)
+                let err = errno
+
+                if rkr == 0 {
+                    footprintBytes = Int64(ru.ri_phys_footprint > 0 ? ru.ri_phys_footprint : ru.ri_resident_size)
+                    let totalMachTicks = ru.ri_user_time &+ ru.ri_system_time
+                    let cpuNs = (totalMachTicks &* numer) / denom
+
+                    if let prev = prevByPID[pid] {
+                        let dt = max(0.20, now - prev.sampledAt)
+                        if cpuNs >= prev.cpuTotalNs {
+                            let deltaSec = Double(cpuNs - prev.cpuTotalNs) / 1_000_000_000.0
+                            cpuPct = (deltaSec / dt) * 100.0
+                        }
+                        if ru.ri_diskio_bytesread >= prev.diskRead {
+                            dReadBps = Int64(Double(ru.ri_diskio_bytesread - prev.diskRead) / dt)
+                        }
+                        if ru.ri_diskio_byteswritten >= prev.diskWrite {
+                            dWriteBps = Int64(Double(ru.ri_diskio_byteswritten - prev.diskWrite) / dt)
+                        }
+                    }
+                    nextPrev[pid] = PrevUsage(
+                        cpuTotalNs: cpuNs,
+                        diskRead: ru.ri_diskio_bytesread,
+                        diskWrite: ru.ri_diskio_byteswritten,
+                        sampledAt: now
+                    )
+                } else if err == ESRCH {
+                    aliveSet.remove(pid)
+                    continue
+                } else {
+                    isCPUReadable = false
+                    var ti = proc_taskinfo()
+                    if proc_pidinfo(pid_t(pid), PROC_PIDTASKINFO, 0, &ti, Int32(MemoryLayout<proc_taskinfo>.size)) > 0 {
+                        footprintBytes = Int64(ti.pti_resident_size)
+                    }
                 }
             }
 
@@ -115,51 +214,122 @@ public final class ProcessTreeSampler: @unchecked Sendable {
             let nIn = netInBpsByPID[pid] ?? 0
             let nOut = netOutBpsByPID[pid] ?? 0
 
-            // Filter completely idle micro-processes before code-sign lookup
-            if rssBytes < 8_388_608 && cpuPct < 0.2 && nIn == 0 && nOut == 0 && dReadBps == 0 && dWriteBps == 0 {
-                continue
-            }
-
-            let meta = resolveSigningMeta(for: execPath)
-            samples.append(
-                ProcessSample(
-                    ts: ts,
-                    pid: pid,
-                    ppid: Int(bsd.pbi_ppid),
-                    name: displayName.isEmpty ? "pid-\(pid)" : displayName,
-                    execPath: execPath,
-                    bundleID: meta.bundleID,
-                    signingTeam: meta.teamID,
-                    cpuPct: cpuPct,
-                    rssBytes: rssBytes,
-                    diskReadBps: dReadBps,
-                    diskWriteBps: dWriteBps,
-                    netInBps: nIn,
-                    netOutBps: nOut,
-                    isAliveNow: true
+            if isCPUReadable {
+                if footprintBytes < 4_194_304 && cpuPct < 0.1 && nIn == 0 && nOut == 0 && dReadBps == 0 && dWriteBps == 0 {
+                    continue
+                }
+                let meta = resolveSigningMeta(for: execPath)
+                readableCandidates.append(
+                    ProcessSample(
+                        ts: ts,
+                        pid: pid,
+                        ppid: ppid,
+                        name: displayName,
+                        execPath: execPath,
+                        bundleID: meta.bundleID,
+                        signingTeam: meta.teamID,
+                        cpuPct: cpuPct,
+                        rssBytes: footprintBytes,
+                        diskReadBps: dReadBps,
+                        diskWriteBps: dWriteBps,
+                        netInBps: nIn,
+                        netOutBps: nOut,
+                        isAliveNow: true,
+                        isCPUReadable: true
+                    )
                 )
-            )
+            } else if nIn > 0 || nOut > 0 || Self.notableSystemDaemons.contains(displayName) {
+                let meta = resolveSigningMeta(for: execPath)
+                unreadableCandidates.append(
+                    ProcessSample(
+                        ts: ts,
+                        pid: pid,
+                        ppid: ppid,
+                        name: displayName,
+                        execPath: execPath,
+                        bundleID: meta.bundleID,
+                        signingTeam: meta.teamID ?? (pid == 0 ? "Apple" : nil),
+                        cpuPct: 0,
+                        rssBytes: footprintBytes,
+                        diskReadBps: 0,
+                        diskWriteBps: 0,
+                        netInBps: nIn,
+                        netOutBps: nOut,
+                        isAliveNow: true,
+                        isCPUReadable: false
+                    )
+                )
+            }
         }
 
         prevByPID = nextPrev
 
-        let ranked = samples.sorted { a, b in
-            let scoreA = a.cpuPct * 25_000_000 + Double(a.rssBytes) + Double(a.netOutBps + a.netInBps) * 40
-            let scoreB = b.cpuPct * 25_000_000 + Double(b.rssBytes) + Double(b.netOutBps + b.netInBps) * 40
-            return scoreA > scoreB
-        }
+        // Build top candidates from each independent dimension (CPU, Memory Footprint, Network) — no blended formula!
+        let perAxisCap = max(10, limit)
+        let topByCPU = readableCandidates
+            .sorted { ($0.cpuPct, $0.rssBytes) > ($1.cpuPct, $1.rssBytes) }
+            .prefix(perAxisCap)
+        let topByMemory = readableCandidates
+            .sorted { ($0.rssBytes, $0.cpuPct) > ($1.rssBytes, $1.cpuPct) }
+            .prefix(perAxisCap)
+        let topByNetwork = readableCandidates
+            .filter { ($0.netInBps + $0.netOutBps) > 0 }
+            .sorted { ($0.netInBps + $0.netOutBps) > ($1.netInBps + $1.netOutBps) }
+            .prefix(perAxisCap)
+        let selectedUnreadable = unreadableCandidates
+            .sorted { ($0.netInBps + $0.netOutBps, -$0.pid) > ($1.netInBps + $1.netOutBps, -$1.pid) }
+            .prefix(8)
 
-        return (Array(ranked.prefix(limit)), hostDiskReadBps, hostDiskWriteBps, aliveSet)
+        var mergedByPID: [Int: ProcessSample] = [:]
+        for p in topByCPU { mergedByPID[p.pid] = p }
+        for p in topByMemory { mergedByPID[p.pid] = p }
+        for p in topByNetwork { mergedByPID[p.pid] = p }
+        for p in selectedUnreadable { mergedByPID[p.pid] = p }
+
+        let ordered = Self.sortProcesses(Array(mergedByPID.values), by: .cpu)
+        return (ordered, hostDiskReadBps, hostDiskWriteBps, aliveSet)
+    }
+
+    public static func sortProcesses(_ list: [ProcessSample], by order: ProcessSortOrder) -> [ProcessSample] {
+        switch order {
+        case .cpu:
+            return list.sorted { a, b in
+                if a.isCPUReadable != b.isCPUReadable {
+                    return a.isCPUReadable && !b.isCPUReadable
+                }
+                if a.cpuPct != b.cpuPct { return a.cpuPct > b.cpuPct }
+                if a.rssBytes != b.rssBytes { return a.rssBytes > b.rssBytes }
+                if (a.netOutBps + a.netInBps) != (b.netOutBps + b.netInBps) {
+                    return (a.netOutBps + a.netInBps) > (b.netOutBps + b.netInBps)
+                }
+                return a.pid < b.pid
+            }
+        case .memory:
+            return list.sorted { a, b in
+                if a.rssBytes != b.rssBytes { return a.rssBytes > b.rssBytes }
+                let aCPU = a.isCPUReadable ? a.cpuPct : -1
+                let bCPU = b.isCPUReadable ? b.cpuPct : -1
+                if aCPU != bCPU { return aCPU > bCPU }
+                return a.pid < b.pid
+            }
+        case .network:
+            return list.sorted { a, b in
+                let aNet = a.netOutBps + a.netInBps
+                let bNet = b.netOutBps + b.netInBps
+                if aNet != bNet { return aNet > bNet }
+                if a.netOutBps != b.netOutBps { return a.netOutBps > b.netOutBps }
+                if a.rssBytes != b.rssBytes { return a.rssBytes > b.rssBytes }
+                return a.pid < b.pid
+            }
+        }
     }
 
     private func resolveSigningMeta(for execPath: String) -> SigningMeta {
+        guard !execPath.isEmpty, execPath.hasPrefix("/") else {
+            return SigningMeta(bundleID: nil, teamID: nil)
+        }
         if let cached = signingCache[execPath] {
             return cached
-        }
-        guard execPath.hasPrefix("/") else {
-            let empty = SigningMeta(bundleID: nil, teamID: nil)
-            signingCache[execPath] = empty
-            return empty
         }
         var staticCode: SecStaticCode?
         let url = URL(fileURLWithPath: execPath) as CFURL

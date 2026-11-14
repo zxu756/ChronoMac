@@ -2,28 +2,41 @@
 
 **English** | **[简体中文](README.zh-CN.md)**
 
-**7-Day macOS System Flight Recorder, 5-Track DVR Oscilloscope & Per-Process Outbound Socket Ledger (`v0.2.0`)**
+**macOS User-Space System Flight Recorder (Records While Open), 5-Track DVR Timeline & External Socket Ledger (`v0.2.0`)**
 
-`Activity Monitor` and `btop` only show *right now*—if your MacBook thermal-throttled at 03:14 AM, ballooned to 6 GB of VM swap, or uploaded 400 MB while unattended and the culprit process exited five minutes later, the forensic trail is gone.
+`Activity Monitor` and `btop` only show *right now*—if your Mac thermal-throttles during a build, balloons into multi-gigabyte VM swap, or uploads hundreds of megabytes while ChronoMac is open and the culprit child process exits minutes later, live monitors have already forgotten what happened.
 
-**ChronoMac `v0.2.0`** continuously records host telemetry, top-30 process blame snapshots, external TCP/UDP socket byte deltas, and local AI coding agent bursts (`Claude Code`, `Codex CLI`, `OpenCode`) into a bounded SQLite WAL time-series flightbox (`<= 250 MB`), running 100% in **non-root user space** with zero kernel extensions (`KEXT`) or paid `NetworkExtension` entitlements—now with live in-app **`中文 / EN`** bilingual switching (`⇧⌘L`) and automatic macOS Chinese locale detection.
+**ChronoMac `v0.2.0`** records host telemetry, top process blame snapshots, external TCP/UDP socket byte deltas, and local AI coding agent session spans (`Claude Code`, `Codex CLI`, `OpenCode`) every 2 seconds **while the ChronoMac app/menu bar is open**, storing history in a bounded SQLite WAL flightbox (`<= 250 MB` including `-wal`/`-shm`) in **100% non-root user space**—with zero kernel extensions (`KEXT`) or paid `NetworkExtension` entitlements, plus live in-app **`中文 / EN`** bilingual switching (`⇧⌘L`).
 
-![ChronoMac DVR Timeline & Process Socket Forensics](docs/screenshot-main.png)
+![ChronoMac DVR Timeline & Process Socket Forensics (DEMO)](docs/screenshot-main.png)
+> **`[DEMO]` Synthetic Preview Data**: The screenshot above is rendered from deterministic synthetic data (`ChronoMac --demo` / `ChronoMonitor.preview()`) illustrating a simulated swap & outbound network incident.
 
 ---
 
-## Key Capabilities
+## Verified Capabilities (`v0.2.0` / M0)
 
-- **Synchronized 5-Track 60fps DVR Oscilloscope (`TimelineScrubberCanvas`)** — Scrub seamlessly across **1h / 6h / 24h / 7d** to correlate SoC CPU & thermal state, resident RAM + VM swap, disk R/W throughput, network egress/ingress, and active AI coding agent windows.
-- **Post-Mortem Process Blame (Even After Exit)** — Time-travel to any anomaly bookmark and inspect exact PID, binary path, Apple/Developer Team ID signature, CPU %, RSS footprint, and outbound transfer rate—highlighting processes that have already terminated (`Exited after spike`).
-- **Per-Process External Socket Ledger** — Parses non-root `nettop` byte deltas and asynchronous local PTR reverse-DNS lookups (loopback `127.0.0.1` automatically excluded) so you know *which binary* talked to *which remote host* and how many megabytes left your Mac.
-- **Peak-Preserving 3-Tier SQLite WAL Compaction** — Keeps raw `2s` ticks for 2 hours, rolls 2h–24h into peak-preserving `15s` buckets, rolls 24h–7d into `60s` buckets, and enforces a hard `250 MB` database cap with `PRAGMA incremental_vacuum`.
-- **Live `中文 / EN` Bilingual Instrument UI (`v0.2.0`)** — Auto-detects Chinese macOS system locale on first launch, remembers preference in `UserDefaults`, and switches every header, DVR track, table, and MenuBar popover instantaneously via the top-right `中文 | EN` pill, `⇧⌘L`, or `--lang zh|en`.
-- **Menu Bar Flightbox + Headless CLI + Read-Only MCP Server** — Ships as both a warm-titanium macOS instrument app and an MCP server (`--mcp`) so Claude Code, Codex, or OpenCode can answer *"Why did my Mac lag 15 minutes ago?"* directly from telemetry.
+- **Synchronized 5-Track DVR Oscilloscope (`TimelineScrubberCanvas`)** — Scrub across **1h / 6h / 24h / 7d** windows of recorded history to correlate SoC CPU & thermal state, host memory + VM swap, disk R/W throughput, external network throughput, and AI coding agent session windows.
+- **Post-Mortem Process Blame with Delta & Liveness** — Time-travel to any recorded timestamp or anomaly bookmark. ChronoMac reports the exact time offset from your requested timestamp (`Snapshot at <ts> (<Y>s from requested time)`), whether each process is **`still running`** or **`exited after spike`**, and lets you rank explicitly **By CPU**, **By Memory**, or **By Network** (`--sort cpu|memory|network`).
+- **Honest `Memory Footprint (phys_footprint)` & Permission Boundaries** — Reports Mach `ri_phys_footprint` (matching macOS Activity Monitor's *Memory* metric rather than BSD `RSS`). System/root processes enumerable via `sysctl(KERN_PROC_ALL)` whose `proc_pid_rusage` counters are restricted in non-root user space (e.g., `WindowServer`, `launchd`, `kernel_task`) remain visible and display **`No permission`** instead of fake `0.0%` readings.
+- **External Socket Ledger with Loopback Isolation** — Computes per-process external socket deltas from non-root `nettop` snapshots with asynchronous local PTR reverse-DNS resolution. Loopback traffic (`127.0.0.0/8`, `::1`, `lo0`) is tracked in its own dedicated counter, excluded from external inbound/outbound totals, and never triggers outbound anomaly alerts. Newly observed PIDs are baselined on first sight, and unresolved executable paths remain blank rather than copying short `comm` names.
+- **Peak-Preserving 3-Tier Compaction & Hard Storage Ceiling** — Keeps raw `2s` ticks for 2 hours, compacts completed buckets into monotonic peak-preserving `15s` (2h–24h) and `60s` (24h–7d) rollups (`ON CONFLICT DO UPDATE SET ... MAX(...)`), checkpoints WAL (`PRAGMA wal_checkpoint(TRUNCATE)`), and enforces a strict on-disk cap (`sqlite + wal + shm <= maxDatabaseBytes`, default `250 MB`) with page reclamation.
+- **Calibrated Human-Readable CLI (`--cli`) & Read-Only MCP Server (`--mcp`)** — `ChronoMac --cli status` samples Mach CPU load ticks twice `1.0s` apart for calibrated CPU% readings; `status`, `blame`, `anomalies`, and `egress` emit clean human-readable output in English or Simplified Chinese (`--lang en|zh`) or structured JSON (`--json`), opening SQLite strictly read-only (`--db <path>` or `CHRONOMAC_DB_PATH`).
+- **Live `中文 / EN` Bilingual UI** — Auto-detects Chinese macOS locale on first launch and switches instantaneously via the `中文 | EN` pill, `⇧⌘L`, or `--lang zh|en`.
 
 <p align="center">
-  <img src="docs/screenshot-menubar.png" width="414" alt="ChronoMac Menu Bar Flightbox" />
+  <img src="docs/screenshot-menubar.png" width="414" alt="ChronoMac Menu Bar Flightbox (DEMO)" />
 </p>
+<p align="center"><em><code>[DEMO]</code> Menu bar popover rendered from synthetic preview telemetry (<code>ChronoMonitor.preview()</code>).</em></p>
+
+---
+
+## Recording Scope & Roadmap
+
+- **Current (`v0.2.0` / M0)**: Telemetry is sampled and persisted every 2 seconds **while the ChronoMac GUI / menu bar app is running**. `--cli` and `--mcp` are strictly read-only query interfaces and do not run a background collector.
+- **Planned (M1)**: Headless background recording daemon (`chronomac record`) + optional `LaunchAgent` plist (`~/Library/LaunchAgents/io.github.zxu756.chronomac.plist`) for continuous 7-day unattended recording when the GUI window is quit, validated against `powermetrics` / `vm_stat` / `netstat -ib`.
+- **Planned (M2)**: Richer attribution & correlation workflows on top of the verified background flightbox.
+
+See [docs/SPEC.md](docs/SPEC.md) for architecture, schema, and measurement specifications.
 
 ---
 
@@ -38,48 +51,50 @@ brew install --cask chronomac
 
 ### Direct Release Archive
 
-Download `ChronoMac-v0.2.0-macos-arm64.zip` from Releases, extract `ChronoMac.app` to `/Applications`, and clear quarantine if needed:
+Download `ChronoMac-v0.2.0-macos-arm64.zip` from Releases, move `ChronoMac.app` to `/Applications`, and clear quarantine if needed:
 
 ```bash
 xattr -cr /Applications/ChronoMac.app
 ```
 
-### Build from Source
+### Build & Test from Source
 
 ```bash
 git clone https://github.com/zxu756/ChronoMac.git
 cd ChronoMac
-swift test --no-parallel
+./Scripts/test.sh scope Store Sampler CLI
 ./Scripts/build-app.sh
-open build/ChronoMac.app
 ```
 
 ---
 
 ## CLI & MCP Server Usage
 
-### Headless CLI & Language Override
+### Headless CLI (`--cli`)
+
+All `--cli` commands open the SQLite database **read-only** (`--db <path>` or `CHRONOMAC_DB_PATH`, defaulting to `~/Library/Application Support/ChronoMac/flightbox.sqlite`). Unknown flags or subcommands print an error to `stderr` and exit with code `2`.
 
 ```bash
-# Launch UI with explicit language override (zh or en)
-/Applications/ChronoMac.app/Contents/MacOS/ChronoMac --lang zh
+# Calibrated live host readout (two CPU ticks 1.0s apart) + flightbox status
+ChronoMac --cli status --lang en
 
-# Live Mach host readout + flightbox status
-/Applications/ChronoMac.app/Contents/MacOS/ChronoMac --cli status
+# Structured JSON host readout
+ChronoMac --cli status --json
 
-# Inspect historical process blame 10 minutes ago
-/Applications/ChronoMac.app/Contents/MacOS/ChronoMac --cli blame --at 10m
+# Inspect historical process blame 10 minutes ago (ranked by CPU, memory, or network)
+ChronoMac --cli blame --at 10m --sort cpu --lang en
+ChronoMac --cli blame --at 10m --sort memory --json
 
-# Summarize recorded swap/thermal/egress anomalies over last 6h
-/Applications/ChronoMac.app/Contents/MacOS/ChronoMac --cli anomalies
+# Summarize window peaks & recorded anomaly bookmarks over the last 6h (360m)
+ChronoMac --cli anomalies --minutes 360 --lang en
 
-# List top external endpoints by bytes transferred over last 24h
-/Applications/ChronoMac.app/Contents/MacOS/ChronoMac --cli egress
+# List top external socket endpoints over the last 24h (loopback excluded)
+ChronoMac --cli egress --hours 24 --lang en
 ```
 
 ### Model Context Protocol (`--mcp`)
 
-Add `ChronoMac` to Claude Code, Codex, or OpenCode so your agent can inspect system bottlenecks during builds and benchmarks:
+Add `ChronoMac` to Claude Code, Codex, or OpenCode so your agent can query recorded spikes read-only over stdio:
 
 ```json
 {
@@ -93,16 +108,21 @@ Add `ChronoMac` to Claude Code, Codex, or OpenCode so your agent can inspect sys
 ```
 
 Exposed read-only MCP tools:
-- `chrono_summary_window` — Peak CPU, swap, outbound egress, and anomaly bookmarks in the last `N` minutes.
-- `chrono_inspect_timestamp` — Exact top-process snapshot at a Unix epoch or `minutes_ago`.
-- `chrono_top_egress_endpoints` — Highest-volume external socket destinations grouped by executable.
+- `chrono_summary_window` — Peak CPU, swap, external outbound egress, and anomaly bookmarks in the last `N` minutes.
+- `chrono_inspect_timestamp` — Top process snapshot near `epoch_seconds` or `minutes_ago` (`sort_by`: `cpu`, `memory`, or `network`), reporting exact snapshot delta seconds, `Memory Footprint (phys_footprint)`, `No permission` for restricted system processes, and `still running` vs `exited after spike`.
+- `chrono_top_egress_endpoints` — Highest-volume external remote endpoints (loopback excluded) over the last `N` hours.
 
 ---
 
 ## Storage & Privacy Architecture
 
-- **Database location**: `~/Library/Application Support/ChronoMac/flightbox.sqlite`
-- **Zero telemetry**: All Mach VM/CPU counters, `proc_pid_rusage` footprints, `nettop` deltas, and `getnameinfo` PTR lookups stay strictly on your local disk. AI agent correlation reads only session modification timestamps—never prompt contents.
+- **Default database path**: `~/Library/Application Support/ChronoMac/flightbox.sqlite` (override via `--db <path>` or `CHRONOMAC_DB_PATH` for isolated testing).
+- **100% local, zero network telemetry**: All Mach VM/CPU counters, `proc_pid_rusage` footprints, `nettop` deltas, and local `getnameinfo` PTR lookups remain strictly on local disk.
+- **Exact AI coding agent metadata read (read-only)**:
+  - **Claude Code (`~/.claude/projects/<slug>/*.jsonl`)**: Reads directory listing modification timestamps and parent folder slug only; `.jsonl` conversation files are never opened or parsed.
+  - **OpenCode (`~/.local/share/opencode/opencode.db`)**: Opens SQLite with `SQLITE_OPEN_READONLY` and reads `session.title` (truncated to 22 characters) and `time_created` / `time_updated` timestamps as timeline labels.
+  - **Codex CLI (`~/.codex/state_5.sqlite`)**: Opens SQLite with `SQLITE_OPEN_READONLY` and reads `threads.cwd` (last path component directory name) and `created_at` / `updated_at` timestamps as timeline labels.
+  - Prompt bodies, model responses, API keys, and repository source files are **never** read.
 
 ## License
 

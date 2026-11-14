@@ -2,7 +2,7 @@ import ChronoMacCore
 import Foundation
 import Testing
 
-@Suite("ChronoMac Core Telemetry & Forensic Storage Tests")
+@Suite("ChronoMac Core Telemetry & Forensic Storage Tests", .timeLimit(.minutes(1)))
 struct ChronoMacCoreTests {
     @Test("Parses sysctl vm.swapusage strings across units")
     func parseSwapUsage() {

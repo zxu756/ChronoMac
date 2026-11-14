@@ -10,13 +10,13 @@ public struct ChronoMenuBarView: View {
     @MainActor
     public init(
         monitor: ChronoMonitor,
-        localizer: AppLocalizer = .shared,
+        localizer: AppLocalizer? = nil,
         displayTimeZone: TimeZone = .current,
         onOpenDashboard: @escaping () -> Void,
         onQuit: @escaping () -> Void
     ) {
         self.monitor = monitor
-        self.localizer = localizer
+        self.localizer = localizer ?? AppLocalizer.shared
         self.displayTimeZone = displayTimeZone
         self.onOpenDashboard = onOpenDashboard
         self.onQuit = onQuit
@@ -30,15 +30,27 @@ public struct ChronoMenuBarView: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .center, spacing: 8) {
                 VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 6) {
+                    HStack(spacing: 5) {
                         Image(systemName: "waveform.path.ecg")
                             .font(.system(size: 11.5, weight: .bold))
                             .foregroundStyle(ChronoTheme.cpuAmber)
-                        Text(localizer.L("ChronoMac Flightbox", "ChronoMac 飞行匣"))
+                        Text(monitor.isStaticPreview ? "ChronoMac" : localizer.L("ChronoMac Flightbox", "ChronoMac 飞行匣"))
                             .font(.system(size: 13.5, weight: .bold))
                             .tracking(localizer.isChinese ? 0 : -0.2)
                             .foregroundStyle(ChronoTheme.ink)
                             .fixedSize(horizontal: true, vertical: false)
+                        if monitor.isStaticPreview {
+                            Text(localizer.L("[DEMO]", "[DEMO·演示]"))
+                                .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                                .foregroundStyle(ChronoTheme.cpuAmber)
+                                .padding(.horizontal, 4.5)
+                                .padding(.vertical, 1.5)
+                                .fixedSize(horizontal: true, vertical: false)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                        .fill(ChronoTheme.cpuAmber.opacity(0.14))
+                                )
+                        }
                     }
                     Text(
                         localizer.L(

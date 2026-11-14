@@ -62,9 +62,20 @@ public final class AppLocalizer: ObservableObject {
     private let userDefaults: UserDefaults?
     private let defaultsKey: String
 
+    public nonisolated static func defaultUserDefaults(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> UserDefaults {
+        if let suite = environment["CHRONOMAC_PREFS_SUITE"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !suite.isEmpty,
+           let isolated = UserDefaults(suiteName: suite) {
+            return isolated
+        }
+        return .standard
+    }
+
     public init(
         arguments: [String] = CommandLine.arguments,
-        userDefaults: UserDefaults = .standard,
+        userDefaults: UserDefaults = AppLocalizer.defaultUserDefaults(),
         preferredLanguages: [String] = Locale.preferredLanguages,
         defaultsKey: String = AppLocalizer.bundleLanguageKey
     ) {
@@ -90,7 +101,7 @@ public final class AppLocalizer: ObservableObject {
 
     public nonisolated static func resolveLanguage(
         arguments: [String] = CommandLine.arguments,
-        userDefaults: UserDefaults = .standard,
+        userDefaults: UserDefaults = AppLocalizer.defaultUserDefaults(),
         preferredLanguages: [String] = Locale.preferredLanguages,
         defaultsKey: String = AppLocalizer.bundleLanguageKey
     ) -> AppLanguage {

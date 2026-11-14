@@ -8,6 +8,13 @@ public struct HostCPUTicks: Sendable, Equatable {
     public var nice: UInt64
 
     public var total: UInt64 { user + system + idle + nice }
+
+    public init(user: UInt64, system: UInt64, idle: UInt64, nice: UInt64) {
+        self.user = user
+        self.system = system
+        self.idle = idle
+        self.nice = nice
+    }
 }
 
 public final class MachSystemSampler: @unchecked Sendable {
@@ -52,6 +59,48 @@ public final class MachSystemSampler: @unchecked Sendable {
         let thermal = Self.mapThermalState(ProcessInfo.processInfo.thermalState)
 
         return (userPct, sysPct, thermal, memUsed, swapUsed)
+    }
+
+    /// Samples Mach host CPU load ticks twice `interval` seconds apart so one-shot CLI calls
+    /// compute an accurate delta over the window instead of returning 0.0%.
+    public func sampleCalibratedHostState(interval: TimeInterval = 1.0) -> HostStateReading {
+        let firstTicks = Self.readHostCPUTicks()
+        if interval > 0 {
+            Thread.sleep(forTimeInterval: interval)
+        }
+        let secondTicks = Self.readHostCPUTicks()
+
+        var userPct = 0.0
+        var sysPct = 0.0
+        if let prev = firstTicks, let cur = secondTicks {
+            let dUser = cur.user >= prev.user ? cur.user - prev.user : 0
+            let dNice = cur.nice >= prev.nice ? cur.nice - prev.nice : 0
+            let dSys = cur.system >= prev.system ? cur.system - prev.system : 0
+            let dIdle = cur.idle >= prev.idle ? cur.idle - prev.idle : 0
+            let dTotal = dUser + dNice + dSys + dIdle
+            if dTotal > 0 {
+                userPct = Double(dUser + dNice) / Double(dTotal) * 100.0
+                sysPct = Double(dSys) / Double(dTotal) * 100.0
+            }
+        }
+        lock.lock()
+        if let cur = secondTicks {
+            previousTicks = cur
+        }
+        lock.unlock()
+
+        let memUsed = Self.readUsedMemoryBytes(totalBytes: totalMemoryBytes)
+        let swapUsed = Self.readSwapUsedBytes()
+        let thermal = Self.mapThermalState(ProcessInfo.processInfo.thermalState)
+
+        return HostStateReading(
+            cpuUserPct: userPct,
+            cpuSysPct: sysPct,
+            thermal: thermal,
+            memUsedBytes: memUsed,
+            memTotalBytes: totalMemoryBytes,
+            swapUsedBytes: swapUsed
+        )
     }
 
     public static func mapThermalState(_ state: ProcessInfo.ThermalState) -> ThermalGrade {

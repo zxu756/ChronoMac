@@ -7,6 +7,39 @@ public enum SampleTier: Int, Codable, CaseIterable, Sendable {
     case rollup60s = 2   // 24h..7d @ 60s peak-preserving buckets
 }
 
+public enum ProcessSortOrder: String, CaseIterable, Identifiable, Codable, Sendable {
+    case cpu = "cpu"
+    case memory = "memory"
+    case network = "network"
+
+    public var id: String { rawValue }
+
+    public func label(in language: AppLanguage) -> String {
+        switch (self, language) {
+        case (.cpu, .en): return "By CPU"
+        case (.cpu, .zhHans): return "按 CPU"
+        case (.memory, .en): return "By Memory"
+        case (.memory, .zhHans): return "按内存"
+        case (.network, .en): return "By Network"
+        case (.network, .zhHans): return "按网络"
+        }
+    }
+
+    public static func parse(_ raw: String?) -> ProcessSortOrder? {
+        guard let raw else { return nil }
+        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "cpu":
+            return .cpu
+        case "mem", "memory", "footprint":
+            return .memory
+        case "net", "network", "egress":
+            return .network
+        default:
+            return nil
+        }
+    }
+}
+
 public enum ThermalGrade: Int, Codable, CaseIterable, Sendable {
     case nominal = 0
     case fair = 1
@@ -89,6 +122,8 @@ public struct SystemTick: Identifiable, Codable, Equatable, Sendable {
     public var diskWriteBps: Int64
     public var netInBps: Int64
     public var netOutBps: Int64
+    public var loopbackInBps: Int64
+    public var loopbackOutBps: Int64
     public var activeAgentCount: Int
     public var activeAgentSummary: String
 
@@ -111,6 +146,8 @@ public struct SystemTick: Identifiable, Codable, Equatable, Sendable {
         diskWriteBps: Int64,
         netInBps: Int64,
         netOutBps: Int64,
+        loopbackInBps: Int64 = 0,
+        loopbackOutBps: Int64 = 0,
         activeAgentCount: Int = 0,
         activeAgentSummary: String = ""
     ) {
@@ -126,6 +163,8 @@ public struct SystemTick: Identifiable, Codable, Equatable, Sendable {
         self.diskWriteBps = max(0, diskWriteBps)
         self.netInBps = max(0, netInBps)
         self.netOutBps = max(0, netOutBps)
+        self.loopbackInBps = max(0, loopbackInBps)
+        self.loopbackOutBps = max(0, loopbackOutBps)
         self.activeAgentCount = max(0, activeAgentCount)
         self.activeAgentSummary = activeAgentSummary
     }
@@ -140,14 +179,21 @@ public struct ProcessSample: Identifiable, Codable, Equatable, Sendable {
     public var bundleID: String?
     public var signingTeam: String?
     public var cpuPct: Double
+    /// Physical memory footprint (`ri_phys_footprint` when readable via `proc_pid_rusage`).
     public var rssBytes: Int64
     public var diskReadBps: Int64
     public var diskWriteBps: Int64
     public var netInBps: Int64
     public var netOutBps: Int64
     public var isAliveNow: Bool
+    public var isCPUReadable: Bool
 
     public var id: String { "\(ts)-\(pid)-\(name)" }
+
+    public var memoryFootprintBytes: Int64 {
+        get { rssBytes }
+        set { rssBytes = max(0, newValue) }
+    }
 
     public init(
         ts: Int64,
@@ -163,7 +209,8 @@ public struct ProcessSample: Identifiable, Codable, Equatable, Sendable {
         diskWriteBps: Int64 = 0,
         netInBps: Int64 = 0,
         netOutBps: Int64 = 0,
-        isAliveNow: Bool = true
+        isAliveNow: Bool = true,
+        isCPUReadable: Bool = true
     ) {
         self.ts = ts
         self.pid = pid
@@ -172,13 +219,29 @@ public struct ProcessSample: Identifiable, Codable, Equatable, Sendable {
         self.execPath = execPath
         self.bundleID = bundleID
         self.signingTeam = signingTeam
-        self.cpuPct = max(0, cpuPct)
+        self.cpuPct = isCPUReadable ? max(0, cpuPct) : 0
         self.rssBytes = max(0, rssBytes)
         self.diskReadBps = max(0, diskReadBps)
         self.diskWriteBps = max(0, diskWriteBps)
         self.netInBps = max(0, netInBps)
         self.netOutBps = max(0, netOutBps)
         self.isAliveNow = isAliveNow
+        self.isCPUReadable = isCPUReadable
+    }
+
+    public func formattedCPU(in language: AppLanguage) -> String {
+        guard isCPUReadable else {
+            return language == .zhHans ? "无权限" : "No permission"
+        }
+        return String(format: "%.1f%%", cpuPct)
+    }
+
+    public func livenessLabel(in language: AppLanguage) -> String {
+        if isAliveNow {
+            return language == .zhHans ? "仍在运行" : "still running"
+        } else {
+            return language == .zhHans ? "尖峰后已退出" : "exited after spike"
+        }
     }
 }
 
@@ -194,7 +257,7 @@ public struct SocketFlowRecord: Identifiable, Codable, Equatable, Sendable {
     public var firstSeen: Int64
     public var lastSeen: Int64
 
-    public var id: String { "\(bucketHour)::\(execPath)::\(remoteEndpoint)" }
+    public var id: String { "\(bucketHour)::\(execPath)::\(processName)::\(remoteEndpoint)" }
 
     public init(
         bucketHour: Int64,
@@ -332,8 +395,17 @@ public enum ChronoFormatter {
 
     public static func clockTime(_ ts: Int64, timeZone: TimeZone = .current) -> String {
         let df = DateFormatter()
+        df.locale = Locale(identifier: "en_US_POSIX")
         df.timeZone = timeZone
         df.dateFormat = "HH:mm:ss"
+        return df.string(from: Date(timeIntervalSince1970: TimeInterval(ts)))
+    }
+
+    public static func isoTimestamp(_ ts: Int64, timeZone: TimeZone = .current) -> String {
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "en_US_POSIX")
+        df.timeZone = timeZone
+        df.dateFormat = "yyyy-MM-dd HH:mm:ss"
         return df.string(from: Date(timeIntervalSince1970: TimeInterval(ts)))
     }
 
@@ -356,7 +428,9 @@ public enum ChronoFormatter {
     }
 
     public static func displayPath(_ raw: String) -> String {
-        var out = raw
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        var out = trimmed
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         if !home.isEmpty, out.hasPrefix(home) {
             out = "~" + out.dropFirst(home.count)

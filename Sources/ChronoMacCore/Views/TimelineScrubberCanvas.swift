@@ -43,10 +43,10 @@ public struct TimelineScrubberCanvas: View {
         scrubbedTimestamp: Int64?,
         spanSeconds: Int64,
         timeZone: TimeZone = .current,
-        localizer: AppLocalizer = .shared,
+        localizer: AppLocalizer? = nil,
         onScrub: @escaping (Int64?) -> Void
     ) {
-        self.localizer = localizer
+        self.localizer = localizer ?? AppLocalizer.shared
         self.ticks = ticks
         self.anomalies = anomalies
         self.agentWindows = agentWindows

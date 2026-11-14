@@ -1,12 +1,14 @@
 import Foundation
 
 /// Read-only Model Context Protocol (MCP) JSON-RPC 2.0 server over stdio so AI coding agents
-/// can query historical system spikes, process blame snapshots, and outbound network flows.
+/// can query historical system spikes, process blame snapshots, and external network flows.
 public final class ChronoMCPServer: Sendable {
     private let store: FlightboxStore
+    private let sampler: any SystemSamplerProtocol
 
-    public init(store: FlightboxStore) {
+    public init(store: FlightboxStore, sampler: any SystemSamplerProtocol = LiveSystemSampler()) {
         self.store = store
+        self.sampler = sampler
     }
 
     public func runStdioLoop() {
@@ -71,7 +73,7 @@ public final class ChronoMCPServer: Sendable {
                 "ChronoMac Window Summary (last \(minutes) min, \(ticks.count) samples):",
                 "- Peak CPU: \(String(format: "%.1f%%", peakCPU?.totalCPUPct ?? 0)) at \(peakCPU.map { ChronoFormatter.clockTime($0.ts) } ?? "n/a")",
                 "- Peak Swap: \(ChronoFormatter.bytes(peakSwap?.swapUsedBytes ?? 0)) at \(peakSwap.map { ChronoFormatter.clockTime($0.ts) } ?? "n/a")",
-                "- Peak Outbound Egress: \(ChronoFormatter.rate(peakOut?.netOutBps ?? 0)) at \(peakOut.map { ChronoFormatter.clockTime($0.ts) } ?? "n/a")"
+                "- Peak External Outbound Egress: \(ChronoFormatter.rate(peakOut?.netOutBps ?? 0)) at \(peakOut.map { ChronoFormatter.clockTime($0.ts) } ?? "n/a")"
             ]
             if !anomalies.isEmpty {
                 lines.append("Recorded Anomaly Bookmarks:")
@@ -85,26 +87,43 @@ public final class ChronoMCPServer: Sendable {
             let targetTs: Int64
             if let tsVal = args["epoch_seconds"] as? Int {
                 targetTs = Int64(tsVal)
+            } else if let tsVal64 = args["epoch_seconds"] as? Int64 {
+                targetTs = tsVal64
             } else if let agoMin = args["minutes_ago"] as? Int {
                 targetTs = now - Int64(agoMin * 60)
             } else {
                 targetTs = now
             }
-            let (actualTs, procs) = store.queryNearestProcesses(at: targetTs)
+            let sortOrder = ProcessSortOrder.parse(args["sort_by"] as? String) ?? .cpu
+            let livePIDs = sampler.currentLivePIDs()
+            let (actualTs, procs) = store.queryNearestProcesses(
+                at: targetTs,
+                livePIDs: livePIDs,
+                sortBy: sortOrder
+            )
             guard let resolved = actualTs, !procs.isEmpty else {
                 return "No recorded process snapshot near timestamp \(targetTs)."
             }
-            var lines = ["Snapshot at \(ChronoFormatter.clockTime(resolved)) (epoch \(resolved)):"]
+            let deltaSec = abs(resolved - targetTs)
+            var lines = [
+                "Snapshot at \(ChronoFormatter.isoTimestamp(resolved)) (epoch \(resolved), \(deltaSec)s from requested time) · Ranking: \(sortOrder.label(in: .en)):"
+            ]
             for p in procs.prefix(12) {
+                let cpuStr = p.formattedCPU(in: .en)
+                let footprintStr = ChronoFormatter.bytes(p.memoryFootprintBytes)
+                let netOutStr = ChronoFormatter.rate(p.netOutBps)
+                let livenessStr = p.livenessLabel(in: .en)
+                let pathStr = p.execPath.isEmpty ? "(path unavailable)" : ChronoFormatter.displayPath(p.execPath)
                 lines.append(
                     String(
-                        format: "  PID %-6d %-24@ CPU %5.1f%%  RSS %-10@  NetOut %-10@  %@",
+                        format: "  PID %-6d %-24@ CPU %-13@ Memory Footprint (phys_footprint) %-10@ NetOut %-10@ [%@] %@",
                         p.pid,
                         (p.name as NSString),
-                        p.cpuPct,
-                        (ChronoFormatter.bytes(p.rssBytes) as NSString),
-                        (ChronoFormatter.rate(p.netOutBps) as NSString),
-                        ChronoFormatter.displayPath(p.execPath)
+                        (cpuStr as NSString),
+                        (footprintStr as NSString),
+                        (netOutStr as NSString),
+                        (livenessStr as NSString),
+                        pathStr
                     )
                 )
             }
@@ -116,10 +135,11 @@ public final class ChronoMCPServer: Sendable {
             if flows.isEmpty {
                 return "No external socket flows recorded in the last \(hours)h."
             }
-            var lines = ["Top External Socket Flows (last \(hours)h):"]
+            var lines = ["Top External Socket Flows (last \(hours)h, loopback excluded):"]
             for f in flows {
                 let host = f.hostname ?? f.remoteEndpoint
-                lines.append("  \(f.processName) -> \(host) | Out: \(ChronoFormatter.bytes(f.totalBytesOut)) | In: \(ChronoFormatter.bytes(f.totalBytesIn))")
+                let pathNote = f.execPath.isEmpty ? "" : " (\(ChronoFormatter.displayPath(f.execPath)))"
+                lines.append("  \(f.processName)\(pathNote) -> \(host) | Out: \(ChronoFormatter.bytes(f.totalBytesOut)) | In: \(ChronoFormatter.bytes(f.totalBytesIn))")
             }
             return lines.joined(separator: "\n")
 
@@ -151,7 +171,7 @@ public final class ChronoMCPServer: Sendable {
     public static let toolDefinitions: [[String: Any]] = [
         [
             "name": "chrono_summary_window",
-            "description": "Summarize peak CPU, Swap, Network Egress, and recorded anomaly bookmarks on this Mac over the last N minutes.",
+            "description": "Summarize peak CPU, Swap, External Network Egress, and recorded anomaly bookmarks on this Mac over the last N minutes.",
             "inputSchema": [
                 "type": "object",
                 "properties": [
@@ -161,18 +181,19 @@ public final class ChronoMCPServer: Sendable {
         ],
         [
             "name": "chrono_inspect_timestamp",
-            "description": "Time-travel to a historical timestamp on this Mac and list the exact top processes (CPU, RSS memory, Disk & Network I/O) at that moment, even if they have since exited.",
+            "description": "Time-travel to a historical timestamp on this Mac and list top processes by CPU, Memory Footprint (phys_footprint), or Network, reporting snapshot delta and whether each process is still running or exited after spike.",
             "inputSchema": [
                 "type": "object",
                 "properties": [
                     "epoch_seconds": ["type": "integer", "description": "Target Unix timestamp in seconds."],
-                    "minutes_ago": ["type": "integer", "description": "Relative minutes ago if epoch_seconds is omitted."]
+                    "minutes_ago": ["type": "integer", "description": "Relative minutes ago if epoch_seconds is omitted."],
+                    "sort_by": ["type": "string", "description": "Sort mode: cpu (default), memory, or network."]
                 ]
             ]
         ],
         [
             "name": "chrono_top_egress_endpoints",
-            "description": "List which local processes transferred the most bytes to external remote IP/hostname endpoints over the last N hours.",
+            "description": "List which local processes transferred the most bytes to external remote IP/hostname endpoints (excluding loopback) over the last N hours.",
             "inputSchema": [
                 "type": "object",
                 "properties": [
