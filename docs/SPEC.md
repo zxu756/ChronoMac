@@ -1,10 +1,10 @@
-# ChronoMac Specification & Measurement Boundaries (`v0.2.0` / M0)
+# ChronoMac Specification & Measurement Boundaries (`v0.3.0` / M0)
 
 ## 1. Scope by Milestone
 
 | Milestone | Status | Scope |
 |---|---|---|
-| **M0 (`v0.2.0` honest baseline)** | Implemented & verified | Live 2s user-space sampling **while the ChronoMac window/menu bar app is open**; monotonic bucket-aligned 3-tier SQLite compaction (`2s` -> `15s` -> `60s`); hard on-disk storage cap (`sqlite + wal + shm <= maxDatabaseBytes`) with WAL checkpoint + page reclamation; loopback-isolated `nettop` delta parser; 1.0s two-tick calibrated `--cli status`; human-readable bilingual CLI (`--lang en\|zh`) + `--json`; honest `Memory Footprint (phys_footprint)` & `No permission` permission disclosure; injectable `SystemSamplerProtocol` with mutation-tested unit suites. |
+| **M0 (`v0.3.0` honest baseline)** | Implemented & verified | Live 2s user-space sampling **while the ChronoMac window/menu bar app is open**; monotonic bucket-aligned 3-tier SQLite compaction (`2s` -> `15s` -> `60s`); hard on-disk storage cap (`sqlite + wal + shm <= maxDatabaseBytes`) with WAL checkpoint + page reclamation; loopback-isolated `nettop` delta parser; 1.0s two-tick calibrated `--cli status`; human-readable bilingual CLI (`--lang en\|zh`) + `--json`; honest `Memory Footprint (phys_footprint)` & `No permission` permission disclosure; injectable `SystemSamplerProtocol` with mutation-tested unit suites. |
 | **M1 (Planned)** | Not in M0 | Headless background daemon (`chronomac record`) + optional `LaunchAgent` plist (`~/Library/LaunchAgents/io.github.zxu756.chronomac.plist`), continuous 7-day unattended verification, and 1h differential validation against `powermetrics`, `vm_stat`, and `netstat -ib`. |
 | **M2 (Planned)** | Not in M0 | Extended forensic export, incident correlation, and workflow automation on top of the M1 daemon. |
 

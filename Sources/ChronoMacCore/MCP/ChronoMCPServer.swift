@@ -36,7 +36,7 @@ public final class ChronoMCPServer: Sendable {
             return encodeResponse(id: id, result: [
                 "protocolVersion": "2024-11-05",
                 "capabilities": ["tools": [String: Any]()],
-                "serverInfo": ["name": "chronomac-mcp", "version": "0.2.0"]
+                "serverInfo": ["name": "chronomac-mcp", "version": "0.3.0"]
             ])
         case "notifications/initialized":
             return nil
