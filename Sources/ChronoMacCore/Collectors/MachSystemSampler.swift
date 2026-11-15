@@ -163,6 +163,11 @@ public final class MachSystemSampler: @unchecked Sendable {
     }
 
     public static func readSwapUsedBytes() -> Int64 {
+        var swap = xsw_usage()
+        var size = MemoryLayout<xsw_usage>.size
+        if sysctlbyname("vm.swapusage", &swap, &size, nil, 0) == 0, size == MemoryLayout<xsw_usage>.size {
+            return Int64(min(UInt64(Int64.max), swap.xsu_used))
+        }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/sbin/sysctl")
         proc.arguments = ["-n", "vm.swapusage"]

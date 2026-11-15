@@ -35,8 +35,8 @@ u_prefix = "/" + "Users/"
 u_esc_prefix = "\\/" + "Users\\/"
 text = re.sub(u_prefix + r"[^/\s\"'\\]+", "$HOME", text)
 text = re.sub(u_esc_prefix + r"[^/\\\s\"']+", "\\/$HOME", text)
-text = re.sub(r"/private/var/folders/[^\s\"']+", "<TMP_DIR>", text)
-text = re.sub(r"/var/folders/[^\s\"']+", "<TMP_DIR>", text)
+text = re.sub(r"/private/var/folders/[^\s\"'（()）\[\],;]+", "<TMP_DIR>", text)
+text = re.sub(r"/var/folders/[^\s\"'（()）\[\],;]+", "<TMP_DIR>", text)
 open(dst, "w", encoding="utf-8").write(text)
 PY
 }
@@ -158,6 +158,37 @@ case "$MODE" in
                 fi
                 echo "==> [milestone 0 summary] unit_tests: passed=$U_PASS, skipped=$U_SKIP, failed=$U_FAIL | m0_acceptance_rows: passed=$ACC_PASS, skipped=$ACC_SKIP, failed=$ACC_FAIL | readme_replay: passed=$RM_PASS, skipped=$RM_SKIP, failed=$RM_FAIL"
                 ;;
+            1|m1|M1)
+                echo "==> [milestone 1] Building ChronoMac debug & release executables..."
+                swift build --product ChronoMac
+                swift build -c release --product ChronoMac
+                swift build --build-tests
+                echo "==> [milestone 1] Running ChronoMac unit test suites..."
+                UNIT_LOG="$TMP_TEST_ROOT/m1-unit.log"
+                run_swift_test_logged "$UNIT_LOG" --skip-build --no-parallel
+                read -r U_PASS U_SKIP U_FAIL < <(parse_swift_test_counts "$UNIT_LOG")
+                echo "==> [milestone 1] Unit test breakdown (skips excluded from pass count): passed=$U_PASS, skipped=$U_SKIP, failed=$U_FAIL"
+                echo "==> [milestone 1] Running M0 regression suite..."
+                M0_LOG="$TMP_TEST_ROOT/m0-acceptance.raw.txt"
+                "$ROOT/Scripts/acceptance/m0-acceptance.sh" | tee "$M0_LOG"
+                read -r M0_PASS M0_SKIP M0_FAIL < <(parse_summary_counts "$M0_LOG")
+                echo "==> [milestone 1] Running M1 10-minute differential & acceptance suite..."
+                M1_LOG="$TMP_TEST_ROOT/m1-differential.raw.txt"
+                "$ROOT/Scripts/acceptance/m1-differential.sh" --duration "${CHRONOMAC_M1_DURATION:-600}" --skip-build | tee "$M1_LOG"
+                read -r M1_PASS M1_SKIP M1_FAIL < <(parse_summary_counts "$M1_LOG")
+                echo "==> [milestone 1] Replaying README & README.zh-CN commands..."
+                RM_LOG="$TMP_TEST_ROOT/readme-commands.raw.txt"
+                "$ROOT/Scripts/acceptance/readme-commands.sh" | tee "$RM_LOG"
+                read -r RM_PASS RM_SKIP RM_FAIL < <(parse_summary_counts "$RM_LOG")
+                if [[ "$RECORD_REPORTS" -eq 1 ]]; then
+                    mkdir -p "$ROOT/reports"
+                    scrub_report_file "$M0_LOG" "$ROOT/reports/m0-acceptance.txt"
+                    scrub_report_file "$M1_LOG" "$ROOT/reports/m1-differential.txt"
+                    scrub_report_file "$RM_LOG" "$ROOT/reports/readme-commands.txt"
+                    echo "==> [milestone 1] Updated scrubbed reports/m0-acceptance.txt, reports/m1-differential.txt, and reports/readme-commands.txt (--record)."
+                fi
+                echo "==> [milestone 1 summary] unit_tests: passed=$U_PASS, skipped=$U_SKIP, failed=$U_FAIL | m0_regression: passed=$M0_PASS, skipped=$M0_SKIP, failed=$M0_FAIL | m1_differential: passed=$M1_PASS, skipped=$M1_SKIP, failed=$M1_FAIL | readme_replay: passed=$RM_PASS, skipped=$RM_SKIP, failed=$RM_FAIL"
+                ;;
             *)
                 echo "Error: Milestone $MS acceptance script is not implemented yet." >&2
                 exit 2
@@ -201,17 +232,13 @@ case "$MODE" in
         LONG_PASS=0
         LONG_SKIP=0
         if [[ "${CHRONOMAC_LONG_RUN:-0}" == "1" ]]; then
-            echo "==> [release] Running long-run differential checks..."
-            if [[ -x "$ROOT/Scripts/acceptance/m1-differential.sh" ]]; then
-                "$ROOT/Scripts/acceptance/m1-differential.sh"
-                LONG_PASS=1
-            else
-                echo "Error: m1-differential.sh not yet available in M0." >&2
-                exit 1
-            fi
+            echo "==> [release] Running 10m M1 differential + 1h headless record checks..."
+            "$ROOT/Scripts/acceptance/m1-differential.sh" --skip-build
+            "$ROOT/Scripts/acceptance/m1-record-1h.sh" --skip-build
+            LONG_PASS=2
         else
-            echo "==> [release] Long-run 1h/7d differential checks: SKIPPED (CHRONOMAC_LONG_RUN!=1)"
-            LONG_SKIP=1
+            echo "==> [release] Long-run 10m/1h/7d differential checks: SKIPPED (CHRONOMAC_LONG_RUN!=1)"
+            LONG_SKIP=2
         fi
         echo "==> [release summary] unit_tests: passed=$U_PASS, skipped=$U_SKIP, failed=$U_FAIL | m0_acceptance_rows: passed=$ACC_PASS, skipped=$ACC_SKIP, failed=$ACC_FAIL | readme_replay: passed=$RM_PASS, skipped=$RM_SKIP, failed=$RM_FAIL | rea_guard: passed=$REA_PASS, skipped=$REA_SKIP | long_run: passed=$LONG_PASS, skipped=$LONG_SKIP"
         ;;

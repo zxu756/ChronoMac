@@ -235,6 +235,219 @@ struct CLITests {
         #expect(!FileManager.default.fileExists(atPath: missingDBPath))
     }
 
+    @Test("M1 Item 1: Headless record daemon writes calibrated ticks, supports concurrent read-only CLI/MCP/UI queries, and flushes WAL on SIGTERM")
+    func m1RecordDaemonGracefulStopAndConcurrentReadOnlyQueries() throws {
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("chronomac-m1-record-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        let dbURL = tmpDir.appendingPathComponent("flightbox.sqlite")
+
+        // 1. Bounded `--cli record --duration 3 --interval 1 --max-db-mb 10 --no-dns`
+        let boundedRes = try Self.runBinary(
+            args: ["--cli", "record", "--interval", "1", "--duration", "3", "--max-db-mb", "10", "--no-dns", "--lang", "en"],
+            dbPath: dbURL.path
+        )
+        #expect(boundedRes.exitCode == 0)
+        #expect(FileManager.default.fileExists(atPath: dbURL.path))
+
+        let roStore = try FlightboxStore(databaseURL: dbURL, readOnly: true)
+        let now = Int64(Date().timeIntervalSince1970)
+        let boundedTicks = roStore.queryTicks(from: now - 30, to: now + 5)
+        #expect(boundedTicks.count >= 2)
+
+        // 2. Indefinite `ChronoMac record` (top-level subcommand without `--cli`), concurrent read-only queries, then SIGTERM
+        let liveDBURL = tmpDir.appendingPathComponent("live-daemon.sqlite")
+        let bin = try Self.locateChronoMacExecutable()
+        let daemon = Process()
+        daemon.executableURL = bin
+        daemon.arguments = ["record", "--db", liveDBURL.path, "--interval", "1", "--max-db-mb", "15", "--no-dns"]
+        var env = ProcessInfo.processInfo.environment
+        env["CHRONOMAC_DB_PATH"] = liveDBURL.path
+        env["CHRONOMAC_AGENT_HOME"] = tmpDir.path
+        daemon.environment = env
+        let daemonOut = Pipe()
+        let daemonErr = Pipe()
+        daemon.standardOutput = daemonOut
+        daemon.standardError = daemonErr
+        try daemon.run()
+        defer { if daemon.isRunning { daemon.terminate() } }
+
+        // Wait until at least 2 ticks are persisted while daemon is actively writing
+        let waitDeadline = Date().addingTimeInterval(8.0)
+        var observedDuringRun = 0
+        while Date() < waitDeadline {
+            if FileManager.default.fileExists(atPath: liveDBURL.path),
+               let reader = try? FlightboxStore(databaseURL: liveDBURL, readOnly: true) {
+                let tsNow = Int64(Date().timeIntervalSince1970)
+                observedDuringRun = reader.queryTicks(from: tsNow - 30, to: tsNow + 5).count
+                if observedDuringRun >= 2 { break }
+            }
+            Thread.sleep(forTimeInterval: 0.20)
+        }
+        #expect(observedDuringRun >= 2)
+        #expect(daemon.isRunning)
+
+        // Concurrent read-only CLI queries (both top-level positional and `--cli`) while `record` is writing!
+        let statusTop = try Self.runBinary(args: ["status", "--json"], dbPath: liveDBURL.path)
+        #expect(statusTop.exitCode == 0)
+        let histEN = try Self.runBinary(args: ["history", "--minutes", "5", "--lang", "en"], dbPath: liveDBURL.path)
+        #expect(histEN.exitCode == 0)
+        let blameZH = try Self.runBinary(args: ["--cli", "blame", "--at", "2s", "--lang", "zh"], dbPath: liveDBURL.path)
+        #expect(blameZH.exitCode == 0)
+
+        // Concurrent read-only MCP query while `record` is writing!
+        let mcpStore = try FlightboxStore(databaseURL: liveDBURL, readOnly: true)
+        let mcp = ChronoMCPServer(store: mcpStore)
+        let mcpSummary = try #require(
+            mcp.handleJSONRPCLine(#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"chrono_summary_window","arguments":{"minutes":5}}}"#)
+        )
+        #expect(mcpSummary.contains("samples):"))
+
+        // Send SIGTERM and verify clean exit code 0 + WAL checkpoint
+        kill(daemon.processIdentifier, SIGTERM)
+        daemon.waitUntilExit()
+        #expect(daemon.terminationStatus == 0)
+    }
+
+    @Test("M1 Item 1: install-agent generates valid LaunchAgent plist XML via --print and --output without touching ~/Library/LaunchAgents")
+    func m1InstallAgentPlistGenerationAndValidation() throws {
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("chronomac-m1-plist-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        let dbPath = tmpDir.appendingPathComponent("flightbox.sqlite").path
+        let plistURL = tmpDir.appendingPathComponent("io.github.zxu756.ChronoMac.record.plist")
+
+        // Missing both --print and --output must exit 2 safely (never auto-writing ~/Library/LaunchAgents!)
+        let missingMode = try Self.runBinary(args: ["--cli", "install-agent", "--lang", "en"], dbPath: dbPath)
+        #expect(missingMode.exitCode == 2)
+
+        // --print emits valid LaunchAgent plist XML to stdout
+        let printed = try Self.runBinary(
+            args: ["--cli", "install-agent", "--print", "--interval", "2", "--max-db-mb", "250"],
+            dbPath: dbPath
+        )
+        #expect(printed.exitCode == 0)
+        #expect(printed.stdout.contains("<key>Label</key>"))
+        #expect(printed.stdout.contains("<string>record</string>"))
+        #expect(printed.stdout.contains(dbPath))
+
+        // --output writes valid plist verified by /usr/bin/plutil -lint
+        let written = try Self.runBinary(
+            args: ["--cli", "install-agent", "--output", plistURL.path, "--interval", "2"],
+            dbPath: dbPath
+        )
+        #expect(written.exitCode == 0)
+        #expect(FileManager.default.fileExists(atPath: plistURL.path))
+
+        let plutil = Process()
+        plutil.executableURL = URL(fileURLWithPath: "/usr/bin/plutil")
+        plutil.arguments = ["-lint", plistURL.path]
+        let lintPipe = Pipe()
+        plutil.standardOutput = lintPipe
+        plutil.standardError = lintPipe
+        try plutil.run()
+        plutil.waitUntilExit()
+        #expect(plutil.terminationStatus == 0)
+    }
+
+    @Test("M1 Item 2 & 3: CLI history, blame, egress, and MCP localize Unattributed / 未归属 and exited short-lived CPU culprit")
+    func m1HistoryAndEgressLocalizeUnattributedAndExitedProcess() throws {
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("chronomac-m1-hist-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        let dbURL = tmpDir.appendingPathComponent("flightbox.sqlite")
+        let store = try FlightboxStore(databaseURL: dbURL)
+
+        let now = Int64(Date().timeIntervalSince1970)
+        let spikeTs = now - 40
+        let deadBurnerPID = 999_887
+
+        try store.recordSampleBatch(
+            tick: SystemTick(
+                ts: spikeTs,
+                cpuUserPct: 92.0,
+                cpuSysPct: 5.0,
+                memUsedBytes: 12_000_000_000,
+                memTotalBytes: 16_000_000_000,
+                swapUsedBytes: 0,
+                diskReadBps: 0,
+                diskWriteBps: 0,
+                netInBps: 2_000_000,
+                netOutBps: 8_000
+            ),
+            processes: [
+                ProcessSample(
+                    ts: spikeTs,
+                    pid: deadBurnerPID,
+                    ppid: 1,
+                    name: "ephemeral-cpu-burner",
+                    execPath: "/tmp/ephemeral-cpu-burner",
+                    cpuPct: 99.4,
+                    rssBytes: 24_000_000,
+                    isAliveNow: true,
+                    isCPUReadable: true
+                ),
+                ProcessSample.unattributedSample(
+                    ts: spikeTs,
+                    netInBps: 2_000_000,
+                    netOutBps: 8_000
+                )
+            ],
+            sockets: [
+                SocketFlowRecord(
+                    bucketHour: (spikeTs / 3600) * 3600,
+                    execPath: "",
+                    processName: NettopDeltaParser.unattributedProcessToken,
+                    remoteEndpoint: NettopDeltaParser.unattributedEndpoint,
+                    protocolName: "nic",
+                    totalBytesIn: 4_000_000,
+                    totalBytesOut: 16_000,
+                    firstSeen: spikeTs,
+                    lastSeen: spikeTs
+                )
+            ],
+            anomalies: []
+        )
+
+        // 1. CLI history in EN & ZH surfaces exited burner AND localizes Unattributed / 未归属
+        let histEN = try Self.runBinary(args: ["--cli", "history", "--minutes", "5", "--lang", "en"], dbPath: dbURL.path)
+        #expect(histEN.exitCode == 0)
+        #expect(histEN.stdout.contains("ephemeral-cpu-burner"))
+        #expect(histEN.stdout.contains("exited after spike"))
+        #expect(histEN.stdout.contains("Unattributed"))
+        #expect(!histEN.stdout.contains("__unattributed__"))
+
+        let histZH = try Self.runBinary(args: ["--cli", "history", "--minutes", "5", "--lang", "zh"], dbPath: dbURL.path)
+        #expect(histZH.exitCode == 0)
+        #expect(histZH.stdout.contains("ephemeral-cpu-burner"))
+        #expect(histZH.stdout.contains("尖峰后已退出"))
+        #expect(histZH.stdout.contains("未归属"))
+        #expect(!histZH.stdout.contains("__unattributed__"))
+
+        // 2. CLI blame & egress in EN & ZH localize Unattributed / 未归属 (never leaking __unattributed__)
+        let blameZH = try Self.runBinary(args: ["--cli", "blame", "--epoch", "\(spikeTs)", "--sort", "network", "--lang", "zh"], dbPath: dbURL.path)
+        #expect(blameZH.exitCode == 0)
+        #expect(blameZH.stdout.contains("未归属"))
+        #expect(!blameZH.stdout.contains("__unattributed__"))
+
+        let egressEN = try Self.runBinary(args: ["--cli", "egress", "--lang", "en"], dbPath: dbURL.path)
+        #expect(egressEN.exitCode == 0)
+        #expect(egressEN.stdout.contains("Unattributed"))
+        #expect(!egressEN.stdout.contains("__unattributed__"))
+
+        let egressZH = try Self.runBinary(args: ["--cli", "egress", "--lang", "zh"], dbPath: dbURL.path)
+        #expect(egressZH.exitCode == 0)
+        #expect(egressZH.stdout.contains("未归属"))
+        #expect(!egressZH.stdout.contains("__unattributed__"))
+
+        // 3. MCP tools also localize Unattributed cleanly
+        let mcp = ChronoMCPServer(store: store)
+        let mcpEgress = try #require(
+            mcp.handleJSONRPCLine(#"{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"chrono_top_egress_endpoints","arguments":{"hours":1}}}"#)
+        )
+        #expect(mcpEgress.contains("Unattributed"))
+        #expect(!mcpEgress.contains("__unattributed__"))
+    }
+
     @Test(
         "W3 Helper: Captures real live host telemetry via ChronoMonitor and FlightboxStore when CHRONOMAC_RUN_LIVE_SEED=1",
         .enabled(
@@ -280,5 +493,143 @@ struct CLITests {
         let now = Int64(Date().timeIntervalSince1970)
         let ticks = store.queryTicks(from: now - 60, to: now + 5)
         #expect(!ticks.isEmpty)
+    }
+
+    @Test("M1 Item 1: FlightboxRecorder.runLoop drains Objective-C autorelease pool every tick so phys_footprint stays flat across long runs")
+    func m1RecordLoopDrainsAutoreleasePoolPerTick() throws {
+        final class AutoreleaseAllocatingSampler: SystemSamplerProtocol, @unchecked Sendable {
+            let totalMemoryBytes: Int64 = 16_000_000_000
+            let recorderRef: () -> FlightboxRecorder?
+            var baselineFootprint: UInt64 = 0
+            var peakDeltaDuringRun: UInt64 = 0
+            var calls = 0
+
+            init(recorderRef: @escaping () -> FlightboxRecorder?) {
+                self.recorderRef = recorderRef
+            }
+
+            static func currentPhysFootprint() -> UInt64 {
+                var ru = rusage_info_v4()
+                let rc = withUnsafeMutablePointer(to: &ru) {
+                    $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { ptr in
+                        proc_pid_rusage(getpid(), RUSAGE_INFO_V4, ptr)
+                    }
+                }
+                return rc == 0 ? ru.ri_phys_footprint : 0
+            }
+
+            func sampleHostState() -> HostStateReading {
+                HostStateReading(cpuUserPct: 8, cpuSysPct: 2, thermal: .nominal, memUsedBytes: 8_000_000_000, memTotalBytes: totalMemoryBytes, swapUsedBytes: 0)
+            }
+
+            func sampleCalibratedHostState(interval: TimeInterval) -> HostStateReading {
+                sampleHostState()
+            }
+
+            func sampleNetwork(now: TimeInterval) -> NettopSnapshotResult {
+                NettopSnapshotResult(perPIDBytesInDelta: [:], perPIDBytesOutDelta: [:], externalSocketDeltas: [], totalInBps: 0, totalOutBps: 0)
+            }
+
+            func sampleProcesses(ts: Int64, netInBpsByPID: [Int: Int64], netOutBpsByPID: [Int: Int64], limit: Int) -> ProcessTreeSnapshot {
+                // Simulate bridged Objective-C autoreleased buffers produced by Foundation Process + Pipe.readDataToEndOfFile()
+                let chunkSize = 1024 * 1024
+                var scratch = [UInt8](repeating: UInt8((calls + 1) & 0xFF), count: chunkSize)
+                let nsCopy = NSData(bytes: &scratch, length: chunkSize)
+                _ = Unmanaged.passRetained(nsCopy).autorelease()
+
+                calls += 1
+                if calls == 2 {
+                    baselineFootprint = Self.currentPhysFootprint()
+                } else if calls > 2, baselineFootprint > 0 {
+                    let cur = Self.currentPhysFootprint()
+                    if cur > baselineFootprint {
+                        peakDeltaDuringRun = max(peakDeltaDuringRun, cur - baselineFootprint)
+                    }
+                }
+                if calls >= 36 {
+                    recorderRef()?.requestStop()
+                }
+                return ProcessTreeSnapshot(processes: [], totalDiskReadBps: 0, totalDiskWriteBps: 0, livePIDs: [1])
+            }
+
+            func resolveExecutablePath(pid: Int) -> String { "" }
+            func currentLivePIDs() -> Set<Int> { [1] }
+            func detectAgentActivity(now: Int64) -> (count: Int, summary: String, recentWindows: [AgentBurstWindow]) { (0, "", []) }
+        }
+
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("chronomac-arp-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        let store = try FlightboxStore(databaseURL: tmpDir.appendingPathComponent("arp.sqlite"))
+
+        weak var weakRecorder: FlightboxRecorder?
+        let sampler = AutoreleaseAllocatingSampler(recorderRef: { weakRecorder })
+        let recorder = FlightboxRecorder(store: store, sampler: sampler, enableReverseDNS: false)
+        weakRecorder = recorder
+
+        var runError: Error?
+        let done = DispatchSemaphore(value: 0)
+        let thread = Thread {
+            do {
+                _ = try recorder.runLoop(interval: 0.2, durationSeconds: nil, installSignalHandlers: false)
+            } catch {
+                runError = error
+            }
+            done.signal()
+        }
+        thread.start()
+        _ = done.wait(timeout: .now() + 20.0)
+        if let runError { throw runError }
+
+        // 34 post-baseline ticks * 1 MiB = 34 MiB if un-drained; with per-tick autoreleasepool, peak delta stays < 12 MiB
+        #expect(sampler.calls >= 36)
+        #expect(sampler.peakDeltaDuringRun < 12 * 1024 * 1024)
+    }
+
+    @Test("M1 Item 1 & 3: FlightboxRecorder aligns integer-second intervals to whole wall-clock seconds with exact 2s cadence")
+    func m1RecorderAlignsIntegerIntervalTicksToWholeWallClockSeconds() throws {
+        final class WallClockProbeSampler: SystemSamplerProtocol, @unchecked Sendable {
+            let totalMemoryBytes: Int64 = 16_000_000_000
+            var hostSampleWallTimes: [TimeInterval] = []
+            private let lock = NSLock()
+
+            func sampleHostState() -> HostStateReading {
+                lock.lock()
+                hostSampleWallTimes.append(Date().timeIntervalSince1970)
+                lock.unlock()
+                return HostStateReading(cpuUserPct: 12, cpuSysPct: 4, thermal: .nominal, memUsedBytes: 8_000_000_000, memTotalBytes: totalMemoryBytes, swapUsedBytes: 0)
+            }
+            func sampleCalibratedHostState(interval: TimeInterval) -> HostStateReading { sampleHostState() }
+            func sampleNetwork(now: TimeInterval) -> NettopSnapshotResult {
+                NettopSnapshotResult(perPIDBytesInDelta: [:], perPIDBytesOutDelta: [:], externalSocketDeltas: [], totalInBps: 0, totalOutBps: 0)
+            }
+            func sampleProcesses(ts: Int64, netInBpsByPID: [Int: Int64], netOutBpsByPID: [Int: Int64], limit: Int) -> ProcessTreeSnapshot {
+                ProcessTreeSnapshot(processes: [], totalDiskReadBps: 0, totalDiskWriteBps: 0, livePIDs: [1])
+            }
+            func resolveExecutablePath(pid: Int) -> String { "" }
+            func currentLivePIDs() -> Set<Int> { [1] }
+            func detectAgentActivity(now: Int64) -> (count: Int, summary: String, recentWindows: [AgentBurstWindow]) { (0, "", []) }
+        }
+
+        // Start deliberately mid-second (~.45s fractional part) where unaligned wakeup would be ~0.45s off whole seconds
+        let frac = Date().timeIntervalSince1970.truncatingRemainder(dividingBy: 1.0)
+        let shiftToMid = (0.45 - frac) >= 0 ? (0.45 - frac) : (1.45 - frac)
+        Thread.sleep(forTimeInterval: shiftToMid)
+
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("chronomac-align-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        let store = try FlightboxStore(databaseURL: tmpDir.appendingPathComponent("align.sqlite"))
+        let probe = WallClockProbeSampler()
+        let recorder = FlightboxRecorder(store: store, sampler: probe, enableReverseDNS: false)
+
+        let count = try recorder.runLoop(interval: 2.0, durationSeconds: 4.0, installSignalHandlers: false)
+        #expect(count == 3)
+
+        // Post-warmup loop samples are the last 3 entries in hostSampleWallTimes; each must fire within <= 0.12s of a whole wall-clock second
+        let loopWallTimes = Array(probe.hostSampleWallTimes.suffix(3))
+        #expect(loopWallTimes.count == 3)
+        for wt in loopWallTimes {
+            let distToWholeSec = abs(wt - wt.rounded())
+            #expect(distToWholeSec <= 0.12)
+        }
     }
 }

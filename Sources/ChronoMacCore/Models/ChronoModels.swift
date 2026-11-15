@@ -190,6 +190,37 @@ public struct ProcessSample: Identifiable, Codable, Equatable, Sendable {
 
     public var id: String { "\(ts)-\(pid)-\(name)" }
 
+    public var isUnattributed: Bool {
+        pid == NettopDeltaParser.unattributedPID || name == NettopDeltaParser.unattributedProcessToken
+    }
+
+    public static func unattributedSample(ts: Int64, netInBps: Int64, netOutBps: Int64) -> ProcessSample {
+        ProcessSample(
+            ts: ts,
+            pid: NettopDeltaParser.unattributedPID,
+            ppid: 0,
+            name: NettopDeltaParser.unattributedProcessToken,
+            execPath: "",
+            bundleID: nil,
+            signingTeam: nil,
+            cpuPct: 0,
+            rssBytes: 0,
+            diskReadBps: 0,
+            diskWriteBps: 0,
+            netInBps: netInBps,
+            netOutBps: netOutBps,
+            isAliveNow: true,
+            isCPUReadable: true
+        )
+    }
+
+    public func localizedName(in language: AppLanguage) -> String {
+        if isUnattributed {
+            return language == .zhHans ? "未归属" : "Unattributed"
+        }
+        return name
+    }
+
     public var memoryFootprintBytes: Int64 {
         get { rssBytes }
         set { rssBytes = max(0, newValue) }
@@ -230,6 +261,9 @@ public struct ProcessSample: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func formattedCPU(in language: AppLanguage) -> String {
+        if isUnattributed {
+            return "—"
+        }
         guard isCPUReadable else {
             return language == .zhHans ? "无权限" : "No permission"
         }
@@ -237,6 +271,9 @@ public struct ProcessSample: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func livenessLabel(in language: AppLanguage) -> String {
+        if isUnattributed {
+            return language == .zhHans ? "网卡差额" : "NIC residual"
+        }
         if isAliveNow {
             return language == .zhHans ? "仍在运行" : "still running"
         } else {
@@ -258,6 +295,24 @@ public struct SocketFlowRecord: Identifiable, Codable, Equatable, Sendable {
     public var lastSeen: Int64
 
     public var id: String { "\(bucketHour)::\(execPath)::\(processName)::\(remoteEndpoint)" }
+
+    public var isUnattributed: Bool {
+        remoteEndpoint == NettopDeltaParser.unattributedEndpoint || processName == NettopDeltaParser.unattributedProcessToken
+    }
+
+    public func localizedProcessName(in language: AppLanguage) -> String {
+        if isUnattributed {
+            return language == .zhHans ? "未归属" : "Unattributed"
+        }
+        return processName
+    }
+
+    public func localizedEndpoint(in language: AppLanguage) -> String {
+        if isUnattributed {
+            return language == .zhHans ? "（物理网卡未归属差额）" : "(physical NIC residual)"
+        }
+        return hostname ?? remoteEndpoint
+    }
 
     public init(
         bucketHour: Int64,

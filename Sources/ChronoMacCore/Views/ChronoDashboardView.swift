@@ -95,8 +95,8 @@ public struct ChronoDashboardView: View {
 
                 Text(
                     localizer.L(
-                        "Flight recorder (records while open) · DVR & external sockets",
-                        "开启期间录制 · 五轨 DVR 与外部外联账本"
+                        "Read-only DVR (`ChronoMac record` daemon) · calibrated NIC sockets",
+                        "只读 DVR 视图（由 `ChronoMac record` 录制）· 物理网卡校准外联账本"
                     )
                 )
                 .font(.system(size: 12))
@@ -147,7 +147,7 @@ public struct ChronoDashboardView: View {
                     Circle()
                         .fill(ChronoTheme.diskPine)
                         .frame(width: 6.5, height: 6.5)
-                    Text(localizer.L("Recording while open (2s WAL)", "开启期间实时录制 (2s WAL)"))
+                    Text(localizer.L("Read-only Flightbox (2s WAL)", "只读飞行匣 (2s WAL)"))
                         .font(.system(size: 11.5, weight: .medium, design: .monospaced))
                         .tracking(0)
                         .foregroundStyle(ChronoTheme.diskPine)
@@ -489,9 +489,11 @@ public struct ChronoDashboardView: View {
     private func processRow(_ p: ProcessSample) -> some View {
         let selected = !p.execPath.isEmpty && monitor.selectedProcessExecPath == p.execPath
         let hot = (p.isCPUReadable && p.cpuPct >= 150) || p.rssBytes >= 4_294_967_296 || p.netOutBps >= 5_242_880
-        let displayedPath = p.execPath.isEmpty
-            ? localizer.L("(path unavailable)", "（路径不可用）")
-            : ChronoFormatter.displayPath(p.execPath)
+        let displayedPath = p.isUnattributed
+            ? localizer.L("Physical NIC delta minus per-PID sockets (non-root kernel_task PID 0 CPU requires root)", "物理网卡总表减进程套接字差额（非 root 下 kernel_task PID 0 CPU 无权限）")
+            : (p.execPath.isEmpty
+                ? localizer.L("(path unavailable · non-root kernel_task PID 0 CPU requires root)", "（路径不可用 · 非 root 下 kernel_task PID 0 CPU 需 root 权限）")
+                : ChronoFormatter.displayPath(p.execPath))
 
         return Button(action: {
             guard !p.execPath.isEmpty else { return }
@@ -501,9 +503,9 @@ public struct ChronoDashboardView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
                         Circle()
-                            .fill(hot ? ChronoTheme.playheadRed : (p.isAliveNow ? ChronoTheme.diskPine : ChronoTheme.subtle))
+                            .fill(p.isUnattributed ? ChronoTheme.netPlum : (hot ? ChronoTheme.playheadRed : (p.isAliveNow ? ChronoTheme.diskPine : ChronoTheme.subtle)))
                             .frame(width: 6.5, height: 6.5)
-                        Text(p.name)
+                        Text(p.localizedName(in: localizer.language))
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(ChronoTheme.ink)
                             .lineLimit(1)
@@ -516,22 +518,14 @@ public struct ChronoDashboardView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(verbatim: "PID \(p.pid)")
+                    Text(verbatim: p.isUnattributed ? "NIC Δ" : "PID \(p.pid)")
                         .font(.system(size: 11, weight: .medium, design: .monospaced))
                         .foregroundStyle(ChronoTheme.ink)
-                    if !p.isAliveNow {
-                        Text(localizer.L("exited after spike", "尖峰后已退出"))
-                            .font(.system(size: 9.5, weight: .semibold))
-                            .tracking(0)
-                            .foregroundStyle(ChronoTheme.playheadRed)
-                            .fixedSize(horizontal: true, vertical: false)
-                    } else {
-                        Text(localizer.L("still running", "仍在运行"))
-                            .font(.system(size: 9.5, weight: .medium))
-                            .tracking(0)
-                            .foregroundStyle(ChronoTheme.diskPine)
-                            .fixedSize(horizontal: true, vertical: false)
-                    }
+                    Text(p.livenessLabel(in: localizer.language))
+                        .font(.system(size: 9.5, weight: !p.isAliveNow ? .semibold : .medium))
+                        .tracking(0)
+                        .foregroundStyle(p.isUnattributed ? ChronoTheme.netPlum : (!p.isAliveNow ? ChronoTheme.playheadRed : ChronoTheme.diskPine))
+                        .fixedSize(horizontal: true, vertical: false)
                 }
                 .frame(width: 108, alignment: .leading)
 
@@ -541,7 +535,7 @@ public struct ChronoDashboardView: View {
                     .frame(width: 92, alignment: .trailing)
                     .fixedSize(horizontal: false, vertical: true)
 
-                Text(p.rssBytes > 0 || p.isCPUReadable ? ChronoFormatter.bytes(p.memoryFootprintBytes) : "—")
+                Text(p.isUnattributed ? "—" : (p.rssBytes > 0 || p.isCPUReadable ? ChronoFormatter.bytes(p.memoryFootprintBytes) : "—"))
                     .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
                     .foregroundStyle(p.rssBytes >= 4_294_967_296 ? ChronoTheme.playheadRed : ChronoTheme.ink)
                     .frame(width: 184, alignment: .trailing)
@@ -644,9 +638,12 @@ public struct ChronoDashboardView: View {
 
     private func socketFlowRow(_ flow: SocketFlowRecord) -> some View {
         let heavyUp = flow.totalBytesOut >= 100 * 1024 * 1024
+        let subtitleEndpoint = flow.isUnattributed
+            ? localizer.L("netstat -ibn minus nettop", "网卡总表减 nettop")
+            : flow.remoteEndpoint
         return VStack(alignment: .leading, spacing: 3) {
             HStack(alignment: .firstTextBaseline) {
-                Text(flow.hostname ?? flow.remoteEndpoint)
+                Text(flow.localizedEndpoint(in: localizer.language))
                     .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
                     .foregroundStyle(heavyUp ? ChronoTheme.playheadRed : ChronoTheme.ink)
                     .lineLimit(1)
@@ -657,7 +654,7 @@ public struct ChronoDashboardView: View {
             }
 
             HStack {
-                Text("\(flow.processName) · \(flow.remoteEndpoint)")
+                Text("\(flow.localizedProcessName(in: localizer.language)) · \(subtitleEndpoint)")
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(ChronoTheme.muted)
                     .lineLimit(1)

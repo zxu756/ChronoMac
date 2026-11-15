@@ -1,0 +1,64 @@
+========================================================================
+ChronoMac M1 Differential & Acceptance Suite (Isolated Temp Dir)
+========================================================================
+Date (UTC):      2026-11-15T07:04:59Z
+macOS:           27.0.1 (26A434) · arm64
+Target Window:   600s @ 2s interval (300 differential points)
+Host Load Avg:   5.88 5.78 5.68
+
+[Setup] Verifying optional LaunchAgent plist generation in isolated temp dir...
+  -> plutil -lint OK (io.github.zxu756.ChronoMac.record, ~/Library/LaunchAgents untouched).
+
+[Live Run] Running headless ChronoMac record (604s) alongside iostat + vm_stat + sysctl + netstat -ibn...
+  -> [t=+4s] Launched 20s single-core CPU burner child process (chronomac_cpu_burn_probe, pid=94936).
+  -> [t=+24s] chronomac_cpu_burn_probe (pid=94936) exited cleanly (rc=0, span=1794726303..1794726323).
+  -> [t=+26s] Transferring 200 MiB over 127.0.0.1 loopback while ChronoMac record is active...
+  -> Concurrent read-only CLI queries (status & history) succeeded while recorder held WAL writer.
+  -> Recorder finished cleanly: ChronoMac recorder stopped cleanly: wrote 303 ticks -> <TMP_DIR> (storage 5.6 MB)
+
+[Row 1/6] Headless `ChronoMac record` continuous 2s flightbox verification...
+  -> system_ticks=303 (post-warmup 2s intervals=302, target >= 300), span=604s
+  -> inter_tick_gap: min=2s, avg=2.00s, max=2s, gaps_gt_10s=0
+  -> [PASS] Row 1: Headless `ChronoMac record` wrote continuous 2s ticks with 0 gaps > 10s.
+
+[Row 2/6] Recorder self-overhead vs documented ceilings in README.md & README.zh-CN.md...
+  -> README ceiling (EN==ZH): self_cpu_avg <= 2.0%, tree_cpu_avg <= 8.0%, phys_footprint <= 50.0 MiB
+  -> Measured self CPU:       avg=0.86%, max=3.94%
+  -> Measured tree CPU:       avg=4.38%, max=11.05% (daemon + nettop/ps/netstat)
+  -> Measured memory:         phys_footprint mean=8.26 MiB, max=13.05 MiB | RSS mean=17.51 MiB, max=22.62 MiB
+  -> [PASS] Row 2: Recorder CPU and memory stayed strictly within README documented bounds.
+
+[Row 3/6] Differential verification vs macOS built-ins (300 target points @ 2s)...
+  -> Aligned 2s points: 300
+  -> CPU vs iostat:     within_10pp=300/300 (100.00%) | mean=0.33 pp, p95=0.80 pp, max=0.96 pp
+  -> Memory vs vm_stat: within_10%=300/300 (100.00%) | mean=0.02%, p95=0.05%, max=0.30%
+  -> Swap vs sysctl:    within_10%=300/300 (100.00%) | mean=0.00%, p95=0.00%, max=0.00%
+  -> Joint (all 3 <=10% simultaneously): 300/300 (100.00%)
+  -> Network & Loopback isolation: 200 MiB 127.0.0.1 probe sent=209715200 B, netstat_lo0_delta=25924756187 B, chrono_peak_loopback_in_bps=232191496 B/s, loopback_sockets_in_ledger=0, loopback_anomalies=0
+  -> Physical NIC external bytes: chrono_in=494312490 B vs netstat_in=494352633 B | chrono_out=123779484 B vs netstat_out=123780549 B
+  -> [PASS] Row 3: >= 95% of 2s differential points within <= 10% across CPU, Memory, and Swap (with loopback strictly excluded from external NIC totals).
+
+[Row 4/6] 40 MB physical NIC download calibration & Unattributed residual...
+  -> Deterministic 40 MB physical NIC calibration unit test: PASS (0.0% error vs netstat -ib, 90.0% on curl, 4 MB in Unattributed/未归属, 0 B smeared onto apsd).
+  -> [SKIP] Row 4 (40 MB live external NIC download): 没跑 (blocked by offline no-network acceptance rule; traffic to own LAN IP on macOS traverses lo0 rather than en0; set CHRONOMAC_LIVE_DOWNLOAD_URL to opt in).
+
+[Row 5/6] Post-mortem query >= 60s after 20s single-core child process exited...
+  -> Queried 587s (>= 60s) after pid=94936 exited: peakCPUPct=99.4%, isAliveNow=False
+  -> [PASS] Row 5: Exited single-core child process & its CPU spike recovered via both timeline blame and `--cli history` (EN/ZH/JSON).
+
+[Row 6/6] 7-day continuous unattended recording...
+  -> [SKIP] Row 6 (7-day continuous unattended run): 没跑 (7-day wall-clock run not executed in this session).
+
+[Mutation Gate] Verifying 4 M1 fault-injection mutations in isolated temp workspace...
+  -> Mutation [m1_nic_drop_unattributed] caught cleanly (compile=0, test_rc=1): ✘ Test "M1 Item 2: Physical NIC calibration on 200 MB loopback + 40 MB en1 download attributes >=80% to curl, puts 4 MB residual in Unattributed/未归属, and smears 0 bytes onto apsd" failed after 0.009 seconds with 4 issues.
+  -> Mutation [m1_t7_disable_ps_supplement] caught cleanly (compile=0, test_rc=1): ✘ Test "T7 (M1): /bin/ps time parser and non-root sampler read WindowServer (UID 88) and launchd (UID 0) CPU without sudo while kernel_task (PID 0) stays No permission" failed after 1.059 seconds with 6 issues.
+  -> Mutation [m1_prune_per_table_wipe] caught cleanly (compile=0, test_rc=1): ✘ Test "M1 DB Pruning: Global oldest-first hard-cap pruning preserves recent anomalies & sockets while trimming 10 MB of old snapshots fast (<1.5s)" failed after 0.670 seconds with 2 issues.
+  -> Mutation [m1_record_skip_batch] caught cleanly (compile=0, test_rc=1): ✘ Test "M1 Item 1: Headless record daemon writes calibrated ticks, supports concurrent read-only CLI/MCP/UI queries, and flushes WAL on SIGTERM" failed after 13.637 seconds with 3 issues.
+  -> [PASS] Mutation Gate: 4/4 M1 fault-injection mutations caught cleanly.
+
+[Host Safety] Verified ~/Library/Application Support, Preferences, and LaunchAgents untouched.
+
+Summary: passed=4, skipped=2, failed=0
+========================================================================
+M1 DIFFERENTIAL SUITE COMPLETE (passed=4, skipped=2, failed=0)
+========================================================================

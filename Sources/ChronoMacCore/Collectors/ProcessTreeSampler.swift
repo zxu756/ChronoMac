@@ -2,6 +2,20 @@ import Darwin
 import Foundation
 import Security
 
+public struct PsProcessReading: Sendable, Equatable {
+    public var pid: Int
+    public var instantCPUPct: Double
+    public var rssBytes: Int64
+    public var cpuTimeNanoseconds: UInt64
+
+    public init(pid: Int, instantCPUPct: Double, rssBytes: Int64, cpuTimeNanoseconds: UInt64) {
+        self.pid = pid
+        self.instantCPUPct = max(0, instantCPUPct)
+        self.rssBytes = max(0, rssBytes)
+        self.cpuTimeNanoseconds = cpuTimeNanoseconds
+    }
+}
+
 public final class ProcessTreeSampler: @unchecked Sendable {
     private struct PrevUsage {
         var cpuTotalNs: UInt64
@@ -21,9 +35,112 @@ public final class ProcessTreeSampler: @unchecked Sendable {
 
     private var prevByPID: [Int: PrevUsage] = [:]
     private var signingCache: [String: SigningMeta] = [:]
+    private let psProvider: @Sendable () -> [Int: PsProcessReading]
     private let lock = NSLock()
 
-    public init() {}
+    public convenience init() {
+        self.init(psProvider: { Self.readLivePsSnapshot() })
+    }
+
+    public init(psProvider: @escaping @Sendable () -> [Int: PsProcessReading]) {
+        self.psProvider = psProvider
+    }
+
+    /// Parses `/bin/ps` cumulative CPU `time` strings (`[[DD-]HH:]MM:SS.ss` or `MMM:SS.ss`) into nanoseconds.
+    public static func parsePsTimeToNanoseconds(_ raw: String) -> UInt64? {
+        let token = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else { return nil }
+
+        var days: UInt64 = 0
+        let rest: String
+        if let dashIdx = token.firstIndex(of: "-") {
+            guard let d = UInt64(token[..<dashIdx]) else { return nil }
+            days = d
+            rest = String(token[token.index(after: dashIdx)...])
+        } else {
+            rest = token
+        }
+
+        let colonParts = rest.split(separator: ":", omittingEmptySubsequences: false)
+        guard colonParts.count == 2 || colonParts.count == 3 else { return nil }
+
+        let hours: UInt64
+        let minutes: UInt64
+        let secToken: Substring
+        if colonParts.count == 3 {
+            guard let h = UInt64(colonParts[0]), let m = UInt64(colonParts[1]) else { return nil }
+            hours = h
+            minutes = m
+            secToken = colonParts[2]
+        } else {
+            guard let m = UInt64(colonParts[0]) else { return nil }
+            hours = 0
+            minutes = m
+            secToken = colonParts[1]
+        }
+
+        let dotParts = secToken.split(separator: ".", omittingEmptySubsequences: false)
+        guard !dotParts.isEmpty, dotParts.count <= 2, let wholeSec = UInt64(dotParts[0]) else { return nil }
+        var fracNs: UInt64 = 0
+        if dotParts.count == 2 {
+            let fracStr = String(dotParts[1].prefix(9))
+            guard let fracVal = UInt64(fracStr) else { return nil }
+            var scale: UInt64 = 1_000_000_000
+            for _ in 0..<fracStr.count { scale /= 10 }
+            fracNs = fracVal * scale
+        }
+
+        let totalSec = days * 86_400 + hours * 3_600 + minutes * 60 + wholeSec
+        return totalSec * 1_000_000_000 + fracNs
+    }
+
+    /// Parses output of `LC_ALL=C /bin/ps -axo pid=,pcpu=,rss=,time=` into `[pid: PsProcessReading]`.
+    public static func parsePsSnapshot(_ text: String) -> [Int: PsProcessReading] {
+        var out: [Int: PsProcessReading] = [:]
+        for line in text.split(whereSeparator: \.isNewline) {
+            let cols = line.split(whereSeparator: \.isWhitespace)
+            guard cols.count >= 4,
+                  let pid = Int(cols[0]),
+                  pid > 0,
+                  let pcpu = Double(cols[1]),
+                  let rssKB = Int64(cols[2]),
+                  let cpuNs = parsePsTimeToNanoseconds(String(cols[3])) else {
+                continue
+            }
+            out[pid] = PsProcessReading(
+                pid: pid,
+                instantCPUPct: pcpu,
+                rssBytes: max(0, rssKB) * 1024,
+                cpuTimeNanoseconds: cpuNs
+            )
+        }
+        return out
+    }
+
+    /// Reads userland process CPU time & RSS across all UIDs (including `WindowServer` UID 88 and `launchd` UID 0)
+    /// without `sudo` via `/bin/ps` (`PID 0` `kernel_task` is a Mach task and remains excluded).
+    public static func readLivePsSnapshot() -> [Int: PsProcessReading] {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/ps")
+        proc.arguments = ["-axo", "pid=,pcpu=,rss=,time="]
+        var env = ProcessInfo.processInfo.environment
+        env["LC_ALL"] = "C"
+        proc.environment = env
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+        do {
+            try proc.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            guard proc.terminationStatus == 0, let text = String(data: data, encoding: .utf8) else {
+                return [:]
+            }
+            return parsePsSnapshot(text)
+        } catch {
+            return [:]
+        }
+    }
 
     /// Enumerates all live PIDs across the system via `sysctl(CTL_KERN, KERN_PROC, KERN_PROC_ALL)`,
     /// including root/system processes (`kernel_task`, `launchd`, `WindowServer`) that `proc_listallpids` omits.
@@ -109,6 +226,7 @@ public final class ProcessTreeSampler: @unchecked Sendable {
         var nextPrev: [Int: PrevUsage] = [:]
         var readableCandidates: [ProcessSample] = []
         var unreadableCandidates: [ProcessSample] = []
+        var lazyPsSnapshot: [Int: PsProcessReading]?
         var hostDiskReadBps: Int64 = 0
         var hostDiskWriteBps: Int64 = 0
 
@@ -200,10 +318,36 @@ public final class ProcessTreeSampler: @unchecked Sendable {
                     aliveSet.remove(pid)
                     continue
                 } else {
-                    isCPUReadable = false
-                    var ti = proc_taskinfo()
-                    if proc_pidinfo(pid_t(pid), PROC_PIDTASKINFO, 0, &ti, Int32(MemoryLayout<proc_taskinfo>.size)) > 0 {
-                        footprintBytes = Int64(ti.pti_resident_size)
+                    if lazyPsSnapshot == nil {
+                        lazyPsSnapshot = psProvider()
+                    }
+                    if let psRow = lazyPsSnapshot?[pid] {
+                        isCPUReadable = true
+                        footprintBytes = psRow.rssBytes
+                        let psCpuNs = psRow.cpuTimeNanoseconds
+                        if let prev = prevByPID[pid] {
+                            let dt = max(0.20, now - prev.sampledAt)
+                            if psCpuNs >= prev.cpuTotalNs {
+                                let deltaSec = Double(psCpuNs - prev.cpuTotalNs) / 1_000_000_000.0
+                                cpuPct = (deltaSec / dt) * 100.0
+                            } else {
+                                cpuPct = psRow.instantCPUPct
+                            }
+                        } else {
+                            cpuPct = psRow.instantCPUPct
+                        }
+                        nextPrev[pid] = PrevUsage(
+                            cpuTotalNs: psCpuNs,
+                            diskRead: 0,
+                            diskWrite: 0,
+                            sampledAt: now
+                        )
+                    } else {
+                        isCPUReadable = false
+                        var ti = proc_taskinfo()
+                        if proc_pidinfo(pid_t(pid), PROC_PIDTASKINFO, 0, &ti, Int32(MemoryLayout<proc_taskinfo>.size)) > 0 {
+                            footprintBytes = Int64(ti.pti_resident_size)
+                        }
                     }
                 }
             }
@@ -215,10 +359,9 @@ public final class ProcessTreeSampler: @unchecked Sendable {
             let nOut = netOutBpsByPID[pid] ?? 0
 
             if isCPUReadable {
-                if footprintBytes < 4_194_304 && cpuPct < 0.1 && nIn == 0 && nOut == 0 && dReadBps == 0 && dWriteBps == 0 {
+                if footprintBytes < 4_194_304 && cpuPct < 0.1 && nIn == 0 && nOut == 0 && dReadBps == 0 && dWriteBps == 0 && !Self.notableSystemDaemons.contains(displayName) {
                     continue
                 }
-                let meta = resolveSigningMeta(for: execPath)
                 readableCandidates.append(
                     ProcessSample(
                         ts: ts,
@@ -226,8 +369,8 @@ public final class ProcessTreeSampler: @unchecked Sendable {
                         ppid: ppid,
                         name: displayName,
                         execPath: execPath,
-                        bundleID: meta.bundleID,
-                        signingTeam: meta.teamID,
+                        bundleID: nil,
+                        signingTeam: nil,
                         cpuPct: cpuPct,
                         rssBytes: footprintBytes,
                         diskReadBps: dReadBps,
@@ -239,7 +382,6 @@ public final class ProcessTreeSampler: @unchecked Sendable {
                     )
                 )
             } else if nIn > 0 || nOut > 0 || Self.notableSystemDaemons.contains(displayName) {
-                let meta = resolveSigningMeta(for: execPath)
                 unreadableCandidates.append(
                     ProcessSample(
                         ts: ts,
@@ -247,8 +389,8 @@ public final class ProcessTreeSampler: @unchecked Sendable {
                         ppid: ppid,
                         name: displayName,
                         execPath: execPath,
-                        bundleID: meta.bundleID,
-                        signingTeam: meta.teamID ?? (pid == 0 ? "Apple" : nil),
+                        bundleID: nil,
+                        signingTeam: pid == 0 ? "Apple" : nil,
                         cpuPct: 0,
                         rssBytes: footprintBytes,
                         diskReadBps: 0,
@@ -264,6 +406,12 @@ public final class ProcessTreeSampler: @unchecked Sendable {
 
         prevByPID = nextPrev
 
+        let unattrIn = netInBpsByPID[NettopDeltaParser.unattributedPID] ?? 0
+        let unattrOut = netOutBpsByPID[NettopDeltaParser.unattributedPID] ?? 0
+        let unattrSample: ProcessSample? = (unattrIn > 0 || unattrOut > 0)
+            ? ProcessSample.unattributedSample(ts: ts, netInBps: unattrIn, netOutBps: unattrOut)
+            : nil
+
         // Build top candidates from each independent dimension (CPU, Memory Footprint, Network) — no blended formula!
         let perAxisCap = max(10, limit)
         let topByCPU = readableCandidates
@@ -276,6 +424,9 @@ public final class ProcessTreeSampler: @unchecked Sendable {
             .filter { ($0.netInBps + $0.netOutBps) > 0 }
             .sorted { ($0.netInBps + $0.netOutBps) > ($1.netInBps + $1.netOutBps) }
             .prefix(perAxisCap)
+        let selectedNotable = readableCandidates
+            .filter { Self.notableSystemDaemons.contains($0.name) }
+            .prefix(6)
         let selectedUnreadable = unreadableCandidates
             .sorted { ($0.netInBps + $0.netOutBps, -$0.pid) > ($1.netInBps + $1.netOutBps, -$1.pid) }
             .prefix(8)
@@ -284,9 +435,26 @@ public final class ProcessTreeSampler: @unchecked Sendable {
         for p in topByCPU { mergedByPID[p.pid] = p }
         for p in topByMemory { mergedByPID[p.pid] = p }
         for p in topByNetwork { mergedByPID[p.pid] = p }
+        for p in selectedNotable { mergedByPID[p.pid] = p }
         for p in selectedUnreadable { mergedByPID[p.pid] = p }
+        if let unattrSample {
+            mergedByPID[unattrSample.pid] = unattrSample
+        }
 
-        let ordered = Self.sortProcesses(Array(mergedByPID.values), by: .cpu)
+        var enriched: [ProcessSample] = []
+        enriched.reserveCapacity(mergedByPID.count)
+        for var p in mergedByPID.values {
+            if !p.isUnattributed && !p.execPath.isEmpty {
+                let meta = resolveSigningMeta(for: p.execPath)
+                p.bundleID = meta.bundleID
+                if let team = meta.teamID {
+                    p.signingTeam = team
+                }
+            }
+            enriched.append(p)
+        }
+
+        let ordered = Self.sortProcesses(enriched, by: .cpu)
         return (ordered, hostDiskReadBps, hostDiskWriteBps, aliveSet)
     }
 

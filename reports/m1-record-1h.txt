@@ -1,0 +1,26 @@
+========================================================================
+ChronoMac M1 Headless Continuous Recording & Self-Overhead Verification
+========================================================================
+Date (UTC): 2026-11-15T04:43:29Z
+macOS:      27.0.1 (26A434) · arm64
+Command:    ChronoMac record --db <TMP_DIR>/flightbox-1h.sqlite --interval 2 --duration 3600 --max-db-mb 250 --no-dns
+
+[Recorder Exit]
+  exit_code=0, wall_elapsed_sec=3602s
+  stdout: ChronoMac 后台录制已安全停止：共写入 1801 条采样 -> <TMP_DIR>（磁盘占用 30.9 MB）
+
+[Row 1 & Row 2 SQLite Gap & Self-Overhead Analysis]
+  system_ticks_count   = 1801 (expected >= 1795)
+  process_snapshots    = 96837
+  span_seconds         = 3603s (min_ts=1794717811, max_ts=1794721414, expected >= 3594s)
+  inter_tick_gap_sec   = min=1s, avg=2.00s, max=5s, gaps_gt_10s=0
+  db_total_bytes       = 32378880 (30.88 MiB)
+  overhead_samples     = 1795
+  recorder_self_cpu    = avg=0.93%, max=6.50% (daemon process alone)
+  recorder_tree_cpu    = avg=4.64%, p95=6.08%, max=13.24% (daemon + nettop/ps/netstat children)
+  recorder_rss_mib     = mean=20.74 MiB, max=37.03 MiB
+  recorder_phys_fp_mib = mean=78.59 MiB, max=148.61 MiB
+
+[PASS] Row 1: Headless `ChronoMac record` wrote continuous 2s ticks with 0 gaps > 10s.
+[PASS] Row 2: Recorder self-overhead empirically measured (CPU% & phys_footprint/RSS MiB).
+Summary: passed=2, skipped=0, failed=0

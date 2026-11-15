@@ -39,7 +39,7 @@ struct ChronoMacApp: App {
             }
         }
 
-        if args.contains("--cli") {
+        if ChronoCLIRunner.shouldHandleHeadless(arguments: args) {
             let exitCode = ChronoCLIRunner.run(arguments: args)
             exit(exitCode)
         }
@@ -54,7 +54,7 @@ struct ChronoMacApp: App {
             _monitor = StateObject(wrappedValue: ChronoMonitor.preview())
         } else {
             let dbURL = FlightboxStore.resolveDatabaseURL(arguments: args)
-            let customStore = try? FlightboxStore(databaseURL: dbURL)
+            let customStore = try? FlightboxStore(databaseURL: dbURL, readOnly: true)
             _monitor = StateObject(wrappedValue: ChronoMonitor(store: customStore))
         }
     }

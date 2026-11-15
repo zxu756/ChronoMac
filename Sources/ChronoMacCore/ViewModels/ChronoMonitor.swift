@@ -28,11 +28,9 @@ public final class ChronoMonitor: ObservableObject {
     public let store: FlightboxStore?
     public let sampler: any SystemSamplerProtocol
 
-    private let anomalyDetector = AnomalyDetector()
-    private let dnsResolver = ReverseDNSResolver()
+    private var recorder: FlightboxRecorder?
     private var livePIDs: Set<Int> = []
     private var sampleTimer: Timer?
-    private var tickCounter: Int = 0
 
     public init(
         store: FlightboxStore? = nil,
@@ -46,7 +44,11 @@ public final class ChronoMonitor: ObservableObject {
         if isStaticPreview {
             self.store = store
         } else {
-            self.store = try? (store ?? FlightboxStore())
+            let resolvedStore = try? (store ?? FlightboxStore(readOnly: true))
+            self.store = resolvedStore
+            if let resolvedStore, !resolvedStore.isReadOnly {
+                self.recorder = FlightboxRecorder(store: resolvedStore, sampler: sampler)
+            }
             if startSamplingTimer {
                 captureLiveTick()
                 self.sampleTimer = Timer.scheduledTimer(withTimeInterval: sampleInterval, repeats: true) { [weak self] _ in
@@ -54,6 +56,9 @@ public final class ChronoMonitor: ObservableObject {
                         self?.captureLiveTick()
                     }
                 }
+            } else if let resolvedStore, resolvedStore.isReadOnly {
+                self.livePIDs = sampler.currentLivePIDs()
+                reloadWindowFromStore()
             }
         }
     }
@@ -147,80 +152,21 @@ public final class ChronoMonitor: ObservableObject {
     public func captureLiveTick(nowOverride: Int64? = nil) {
         guard !isStaticPreview, let store else { return }
         let now = nowOverride ?? Int64(Date().timeIntervalSince1970)
-        let host = sampler.sampleHostState()
-        let net = sampler.sampleNetwork(now: TimeInterval(now))
-        let procSnap = sampler.sampleProcesses(
-            ts: now,
-            netInBpsByPID: net.perPIDBytesInDelta,
-            netOutBpsByPID: net.perPIDBytesOutDelta,
-            limit: 30
-        )
-        let procs = procSnap.processes
-        self.livePIDs = procSnap.livePIDs
-
-        let agentInfo = sampler.detectAgentActivity(now: now)
-        self.agentWindows = agentInfo.recentWindows
-
-        var pidToExec: [Int: String] = [:]
-        for p in procs where !p.execPath.isEmpty {
-            pidToExec[p.pid] = p.execPath
+        if store.isReadOnly {
+            self.livePIDs = sampler.currentLivePIDs()
+            self.agentWindows = sampler.detectAgentActivity(now: now).recentWindows
+            reloadWindowFromStore(referenceNow: now)
+            return
         }
-
-        let bucketHour = (now / 3600) * 3600
-        let socketRecords: [SocketFlowRecord] = net.externalSocketDeltas.map { s in
-            // Never copy processName into execPath; leave "" if path cannot be resolved!
-            let resolvedExec = pidToExec[s.pid] ?? sampler.resolveExecutablePath(pid: s.pid)
-            let cleanExec = resolvedExec.hasPrefix("/") ? resolvedExec : ""
-            return SocketFlowRecord(
-                bucketHour: bucketHour,
-                execPath: cleanExec,
-                processName: s.processName,
-                remoteEndpoint: s.remoteEndpoint,
-                hostname: nil,
-                protocolName: s.protocolName,
-                totalBytesIn: s.deltaBytesIn,
-                totalBytesOut: s.deltaBytesOut,
-                firstSeen: now,
-                lastSeen: now
-            )
+        let activeRecorder = recorder ?? {
+            let r = FlightboxRecorder(store: store, sampler: sampler)
+            self.recorder = r
+            return r
+        }()
+        if let result = try? activeRecorder.captureTick(nowOverride: now) {
+            self.livePIDs = result.livePIDs
+            self.agentWindows = result.agentWindows
         }
-
-        let tick = SystemTick(
-            ts: now,
-            tier: .raw2s,
-            cpuUserPct: host.cpuUserPct,
-            cpuSysPct: host.cpuSysPct,
-            thermalGrade: host.thermal,
-            memUsedBytes: host.memUsedBytes,
-            memTotalBytes: sampler.totalMemoryBytes,
-            swapUsedBytes: host.swapUsedBytes,
-            diskReadBps: procSnap.totalDiskReadBps,
-            diskWriteBps: procSnap.totalDiskWriteBps,
-            netInBps: net.totalInBps,
-            netOutBps: net.totalOutBps,
-            loopbackInBps: net.loopbackRxBytesPerSec,
-            loopbackOutBps: net.loopbackTxBytesPerSec,
-            activeAgentCount: agentInfo.count,
-            activeAgentSummary: agentInfo.summary
-        )
-
-        let detectedAnomalies = anomalyDetector.evaluate(tick: tick, processes: procs, sockets: socketRecords)
-        try? store.recordSampleBatch(tick: tick, processes: procs, sockets: socketRecords, anomalies: detectedAnomalies)
-
-        for s in socketRecords.prefix(8) {
-            let storeRef = store
-            Task {
-                await dnsResolver.resolveIfNeeded(endpoint: s.remoteEndpoint) { endpoint, host in
-                    storeRef.updateHostname(for: endpoint, hostname: host)
-                }
-            }
-        }
-
-        tickCounter += 1
-        if tickCounter % 30 == 0 {
-            try? store.runRollupAndRetention(now: now)
-        }
-
         reloadWindowFromStore(referenceNow: now)
     }
 
@@ -399,6 +345,23 @@ public final class ChronoMonitor: ObservableObject {
                 name: "WindowServer",
                 execPath: "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
                 bundleID: "com.apple.WindowServer",
+                signingTeam: "Apple",
+                cpuPct: 8.6,
+                rssBytes: 432_013_312,
+                diskReadBps: 0,
+                diskWriteBps: 0,
+                netInBps: 0,
+                netOutBps: 0,
+                isAliveNow: true,
+                isCPUReadable: true
+            ),
+            ProcessSample(
+                ts: actualSpikeTickTs,
+                pid: 0,
+                ppid: 0,
+                name: "kernel_task",
+                execPath: "",
+                bundleID: nil,
                 signingTeam: "Apple",
                 cpuPct: 0,
                 rssBytes: 0,
