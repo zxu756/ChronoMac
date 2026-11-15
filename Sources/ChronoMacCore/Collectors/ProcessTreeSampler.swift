@@ -408,7 +408,7 @@ public final class ProcessTreeSampler: @unchecked Sendable {
 
         let unattrIn = netInBpsByPID[NettopDeltaParser.unattributedPID] ?? 0
         let unattrOut = netOutBpsByPID[NettopDeltaParser.unattributedPID] ?? 0
-        let unattrSample: ProcessSample? = (unattrIn > 0 || unattrOut > 0)
+        let unattrSample: ProcessSample? = (unattrIn != 0 || unattrOut != 0)
             ? ProcessSample.unattributedSample(ts: ts, netInBps: unattrIn, netOutBps: unattrOut)
             : nil
 
@@ -482,10 +482,10 @@ public final class ProcessTreeSampler: @unchecked Sendable {
             }
         case .network:
             return list.sorted { a, b in
-                let aNet = a.netOutBps + a.netInBps
-                let bNet = b.netOutBps + b.netInBps
+                let aNet = abs(a.netOutBps) + abs(a.netInBps)
+                let bNet = abs(b.netOutBps) + abs(b.netInBps)
                 if aNet != bNet { return aNet > bNet }
-                if a.netOutBps != b.netOutBps { return a.netOutBps > b.netOutBps }
+                if abs(a.netOutBps) != abs(b.netOutBps) { return abs(a.netOutBps) > abs(b.netOutBps) }
                 if a.rssBytes != b.rssBytes { return a.rssBytes > b.rssBytes }
                 return a.pid < b.pid
             }

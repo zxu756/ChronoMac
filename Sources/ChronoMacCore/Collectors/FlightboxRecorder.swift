@@ -17,6 +17,8 @@ public final class FlightboxRecorder: @unchecked Sendable {
     private let wakeSemaphore = DispatchSemaphore(value: 0)
     private var stopRequested = false
     private var tickCounter = 0
+    private var gapCounter = 0
+    private var pendingGaps: [SamplingGapRecord] = []
 
     public init(
         store: FlightboxStore,
@@ -34,6 +36,51 @@ public final class FlightboxRecorder: @unchecked Sendable {
         stateLock.lock()
         defer { stateLock.unlock() }
         return stopRequested
+    }
+
+    public var recordedGapCount: Int {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return gapCounter
+    }
+
+    private func recordTickFailure(ts: Int64, error: Error) {
+        let reason = error.localizedDescription
+        stateLock.lock()
+        gapCounter += 1
+        if pendingGaps.count >= 1_024 {
+            pendingGaps.removeFirst()
+        }
+        pendingGaps.append(SamplingGapRecord(ts: ts, reason: reason))
+        stateLock.unlock()
+
+        let warning = "[ChronoMac record] sampling gap at \(ts): \(reason)\n"
+        fputs(warning, stderr)
+        flushPendingGaps()
+    }
+
+    private func flushPendingGaps() {
+        stateLock.lock()
+        guard !pendingGaps.isEmpty else {
+            stateLock.unlock()
+            return
+        }
+        let snapshot = pendingGaps
+        stateLock.unlock()
+
+        var remaining: [SamplingGapRecord] = []
+        for gap in snapshot {
+            do {
+                try store.recordSamplingGap(ts: gap.ts, reason: gap.reason)
+            } catch {
+                remaining.append(gap)
+            }
+        }
+
+        stateLock.lock()
+        let persistedTimestamps = Set(snapshot.map(\.ts)).subtracting(Set(remaining.map(\.ts)))
+        pendingGaps.removeAll { persistedTimestamps.contains($0.ts) }
+        stateLock.unlock()
     }
 
     public func requestStop() {
@@ -197,6 +244,7 @@ public final class FlightboxRecorder: @unchecked Sendable {
         let endUptime = durationSeconds.map { startUptime + max(0.0, $0) }
         var lastRecordedEpoch: Int64 = 0
         var recordedTicks = 0
+        var scheduledSteps = 0
 
         while !isStopped {
             var tickEpoch = Int64(Date().timeIntervalSince1970.rounded())
@@ -205,12 +253,18 @@ public final class FlightboxRecorder: @unchecked Sendable {
             }
             lastRecordedEpoch = tickEpoch
 
-            try autoreleasepool {
-                _ = try captureTick(nowOverride: tickEpoch)
+            autoreleasepool {
+                do {
+                    _ = try captureTick(nowOverride: tickEpoch)
+                    flushPendingGaps()
+                    recordedTicks += 1
+                } catch {
+                    recordTickFailure(ts: tickEpoch, error: error)
+                }
             }
-            recordedTicks += 1
+            scheduledSteps += 1
 
-            let nextUptime = startUptime + Double(recordedTicks) * effectiveInterval
+            let nextUptime = startUptime + Double(scheduledSteps) * effectiveInterval
             if let endUptime, nextUptime > endUptime + 0.05 {
                 break
             }
@@ -221,6 +275,7 @@ public final class FlightboxRecorder: @unchecked Sendable {
             }
         }
 
+        flushPendingGaps()
         try? store.runRollupAndRetention(now: Int64(Date().timeIntervalSince1970))
         store.checkpointWAL()
         return recordedTicks

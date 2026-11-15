@@ -172,7 +172,13 @@ top_cpu = float(u_str) + float(s_str)
 diff = abs(cli_cpu - top_cpu)
 new_max = max(prev_max, diff)
 ok = (cli_cpu > 0.0) and (diff <= 10.0)
-print(f"{cli_cpu:.1f} {top_cpu:.1f} {diff:.1f} {'OK' if ok else 'SPIKE'} {new_max:.1f}")
+if ok:
+    verdict = "OK"
+elif cli_cpu <= 0.0:
+    verdict = "ZERO_CLI"
+else:
+    verdict = "DIFF_GT_10PP"
+print(f"{cli_cpu:.1f} {top_cpu:.1f} {diff:.1f} {verdict} {new_max:.1f}")
 PY
             )
             if [[ -e "$ROW4_MISSING_DB" ]]; then
@@ -185,14 +191,18 @@ PY
                 FINAL_VERDICT="OK"
                 break
             else
-                echo "    Run $RUN_IDX ($LANG_CODE, attempt $ATTEMPT/3, loadavg=[$LOADAVG]): ChronoMac=${CLI_CPU}% | top=${TOP_CPU}% | diff=${DIFF_CPU} pp -> $VERDICT (transient load spike >10.0 pp)"
+                STEP_LABEL="RETRY"
+                if [[ "$ATTEMPT" -ge 3 ]]; then
+                    STEP_LABEL="FAIL"
+                fi
+                echo "    Run $RUN_IDX ($LANG_CODE, attempt $ATTEMPT/3, loadavg=[$LOADAVG]): ChronoMac=${CLI_CPU}% | top=${TOP_CPU}% | diff=${DIFF_CPU} pp -> ${STEP_LABEL} (measured diff=${DIFF_CPU} pp, ChronoMac=${CLI_CPU}%, status=${VERDICT})"
                 if [[ "$ATTEMPT" -lt 3 ]]; then
                     sleep 0.8
                 fi
             fi
         done
         if [[ "$FINAL_VERDICT" != "OK" ]]; then
-            echo "FAIL [Row 4]: Run $RUN_IDX ($LANG_CODE) exceeded 10.0 pp across all 3 attempts (last cli=$CLI_CPU, top=$TOP_CPU, diff=$DIFF_CPU)" >&2
+            echo "FAIL [Row 4]: Run $RUN_IDX ($LANG_CODE) did not satisfy (ChronoMac > 0.0% and diff <= 10.0 pp) across 3 attempts (last ChronoMac=${CLI_CPU}%, top=${TOP_CPU}%, diff=${DIFF_CPU} pp, status=${VERDICT}; uptime: $(/usr/bin/uptime | sed 's/^[[:space:]]*//'))" >&2
             cat "$CLI_OUT_FILE" >&2
             exit 1
         fi

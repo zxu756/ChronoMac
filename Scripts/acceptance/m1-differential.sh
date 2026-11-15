@@ -8,6 +8,8 @@ DURATION=600
 INTERVAL=2
 OUTPUT_REPORT=""
 SKIP_BUILD=0
+OFFLINE_NIC_60S_ONLY=0
+TMP_ROOT_ARG=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -27,6 +29,14 @@ while [[ $# -gt 0 ]]; do
             SKIP_BUILD=1
             shift
             ;;
+        --offline-nic-60s-only)
+            OFFLINE_NIC_60S_ONLY=1
+            shift
+            ;;
+        --tmp-root)
+            TMP_ROOT_ARG="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1" >&2
             exit 2
@@ -34,22 +44,41 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "$DURATION" -lt 36 ]]; then
+if [[ "$OFFLINE_NIC_60S_ONLY" -ne 1 ]] && [[ "$DURATION" -lt 36 ]]; then
     echo "Error: --duration must be >= 36 seconds to run CPU burner + loopback probes cleanly (got $DURATION)." >&2
     exit 2
 fi
 
-TMP_DIFF="$(mktemp -d "${TMPDIR:-/tmp}/chronomac-m1-diff.XXXXXX")"
+if [[ -n "$TMP_ROOT_ARG" ]]; then
+    TMP_DIFF="$(mktemp -d "$TMP_ROOT_ARG/chronomac-m1-diff.XXXXXX")"
+else
+    TMP_DIFF="$(mktemp -d "${TMPDIR:-/tmp}/chronomac-m1-diff.XXXXXX")"
+fi
 REC_PID=""
 MON_PID=""
 REF_PID=""
 BURN_PID=""
 
+terminate_and_reap() {
+    local p="$1"
+    if [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null; then
+        kill -TERM "$p" 2>/dev/null || true
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if ! kill -0 "$p" 2>/dev/null; then
+                break
+            fi
+            sleep 0.2
+        done
+        if kill -0 "$p" 2>/dev/null; then
+            kill -KILL "$p" 2>/dev/null || true
+        fi
+        wait "$p" 2>/dev/null || true
+    fi
+}
+
 cleanup() {
     for p in "$BURN_PID" "$REF_PID" "$MON_PID" "$REC_PID"; do
-        if [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null; then
-            kill -TERM "$p" 2>/dev/null || true
-        fi
+        terminate_and_reap "$p"
     done
     rm -rf "$TMP_DIFF"
 }
@@ -101,6 +130,206 @@ fi
 WORK_BIN="$TMP_DIFF/ChronoMac"
 cp "$REL_BIN" "$WORK_BIN"
 chmod +x "$WORK_BIN"
+
+run_offline_60s_nic_calibration() {
+    local cal_db="$TMP_DIFF/row4-offline-60s.sqlite"
+    rm -f "$cal_db" "${cal_db}-wal" "${cal_db}-shm"
+    /usr/bin/python3 - "$WORK_BIN" "$cal_db" "$TMP_DIFF/agent-home" <<'PY'
+import os, re, socket, sqlite3, subprocess, sys, threading, time
+
+work_bin, cal_db, agent_home = sys.argv[1], sys.argv[2], sys.argv[3]
+PHYS_EXT_RE = re.compile(r"^(?:en\d+|pdp_ip\d+)$")
+
+def current_uptime_str():
+    try:
+        return subprocess.check_output(["/usr/bin/uptime"], text=True).strip()
+    except Exception:
+        return "unavailable"
+
+def read_netstat_ib():
+    # Numeric mode (-n) of `/usr/sbin/netstat -ib` reads identical `<Link#N>` kernel byte counters
+    # without issuing reverse-DNS network queries under the strict offline rule.
+    out = subprocess.check_output(["/usr/sbin/netstat", "-ibn"], text=True)
+    ext_ib = {}
+    ext_ob = {}
+    lo_ib = {}
+    lo_ob = {}
+    for ln in out.splitlines()[1:]:
+        cols = ln.split()
+        if len(cols) < 10 or not cols[2].startswith("<Link#"):
+            continue
+        raw_name = cols[0].rstrip("*")
+        name = raw_name.lower()
+        try:
+            ib = int(cols[-5])
+            ob = int(cols[-2])
+        except ValueError:
+            continue
+        if name.startswith("lo"):
+            lo_ib[name] = max(lo_ib.get(name, 0), ib)
+            lo_ob[name] = max(lo_ob.get(name, 0), ob)
+        elif PHYS_EXT_RE.match(name):
+            ext_ib[name] = max(ext_ib.get(name, 0), ib)
+            ext_ob[name] = max(ext_ob.get(name, 0), ob)
+    active_ifaces = sorted(k for k in ext_ib.keys() if (ext_ib[k] > 0 or ext_ob[k] > 0))
+    if not active_ifaces:
+        active_ifaces = sorted(ext_ib.keys())
+    return (sum(ext_ib.values()), sum(ext_ob.values()), sum(lo_ib.values()), sum(lo_ob.values()), active_ifaces)
+
+def run_local_loopback_burst(megabytes=64):
+    total_bytes = megabytes * 1024 * 1024
+    chunk = b"M" * (256 * 1024)
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    port = srv.getsockname()[1]
+    srv.listen(1)
+    def reader():
+        conn, _ = srv.accept()
+        while conn.recv(256 * 1024):
+            pass
+        conn.close()
+        srv.close()
+    th = threading.Thread(target=reader, daemon=True)
+    th.start()
+    cli = socket.create_connection(("127.0.0.1", port))
+    sent = 0
+    while sent < total_bytes:
+        step = min(len(chunk), total_bytes - sent)
+        cli.sendall(memoryview(chunk)[:step])
+        sent += step
+    time.sleep(2.4)
+    cli.shutdown(socket.SHUT_WR)
+    cli.close()
+    th.join(timeout=10.0)
+
+env = os.environ.copy()
+env["CHRONOMAC_DB_PATH"] = cal_db
+env["CHRONOMAC_AGENT_HOME"] = agent_home
+
+rec_proc = subprocess.Popen(
+    [work_bin, "record", "--db", cal_db, "--interval", "2", "--duration", "60", "--max-db-mb", "250", "--no-dns"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+    env=env,
+)
+try:
+    # Align `netstat -ib` baseline snapshot to Tick 0 commit so both sides span exact [Tick 0, Tick 30] (60s)
+    deadline = time.monotonic() + 8.0
+    tick0_seen = False
+    while time.monotonic() < deadline:
+        if rec_proc.poll() is not None:
+            break
+        if os.path.exists(cal_db):
+            try:
+                c = sqlite3.connect(f"file:{cal_db}?mode=ro", uri=True)
+                cnt = c.execute("SELECT COUNT(*) FROM system_ticks;").fetchone()[0]
+                c.close()
+                if cnt >= 1:
+                    tick0_seen = True
+                    break
+            except Exception:
+                pass
+        time.sleep(0.015)
+
+    pre_ext_in, pre_ext_out, pre_lo_in, pre_lo_out, ifaces = read_netstat_ib()
+    if not tick0_seen:
+        out_s, err_s = rec_proc.communicate(timeout=10)
+        print(f"FAIL [Row 4 Offline 60s]: Recorder did not write Tick 0 within 8s! stderr={err_s} (uptime: {current_uptime_str()})", file=sys.stderr)
+        sys.exit(1)
+
+    # Inject 64 MiB 127.0.0.1 loopback transfer mid-window to verify lo0 stays excluded from external totals
+    time.sleep(4.0)
+    run_local_loopback_burst(64)
+
+    out_s, err_s = rec_proc.communicate(timeout=75)
+    post_ext_in, post_ext_out, post_lo_in, post_lo_out, _ = read_netstat_ib()
+    if rec_proc.returncode != 0:
+        print(f"FAIL [Row 4 Offline 60s]: ChronoMac record exited with {rec_proc.returncode}: {err_s} (uptime: {current_uptime_str()})", file=sys.stderr)
+        sys.exit(1)
+finally:
+    if rec_proc.poll() is None:
+        rec_proc.terminate()
+        try:
+            rec_proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            rec_proc.kill()
+            rec_proc.wait()
+
+conn = sqlite3.connect(f"file:{cal_db}?mode=ro", uri=True)
+ticks = conn.execute("SELECT ts, net_in_bps, net_out_bps, loopback_in_bps, loopback_out_bps FROM system_ticks ORDER BY ts ASC;").fetchall()
+loop_sock_rows = conn.execute("""
+SELECT COUNT(*) FROM socket_ledger
+WHERE remote_endpoint LIKE '127.%' OR remote_endpoint LIKE '::1%' OR remote_endpoint LIKE 'fe80::1%';
+""").fetchone()[0]
+conn.close()
+
+if len(ticks) < 30:
+    print(f"FAIL [Row 4 Offline 60s]: Expected >= 30 post-Tick-0 rows for 60s @ 2s, got {len(ticks)} rows (uptime: {current_uptime_str()})", file=sys.stderr)
+    sys.exit(1)
+
+span_s = ticks[-1][0] - ticks[0][0]
+chrono_ext_in = 0
+chrono_ext_out = 0
+for idx in range(1, len(ticks)):
+    dt_i = max(1.0, float(ticks[idx][0] - ticks[idx - 1][0]))
+    chrono_ext_in += int(round(float(ticks[idx][1]) * dt_i))
+    chrono_ext_out += int(round(float(ticks[idx][2]) * dt_i))
+
+peak_loop_in = max((t[3] for t in ticks), default=0)
+netstat_phys_in = max(0, post_ext_in - pre_ext_in)
+netstat_phys_out = max(0, post_ext_out - pre_ext_out)
+netstat_lo0_in = max(0, post_lo_in - pre_lo_in)
+
+in_diff_b = chrono_ext_in - netstat_phys_in
+out_diff_b = chrono_ext_out - netstat_phys_out
+in_pct_str = f"{abs(in_diff_b) / netstat_phys_in * 100.0:.2f}%" if netstat_phys_in > 0 else ("0.00% (ref=0)" if chrono_ext_in == 0 else "n/a (ref=0)")
+out_pct_str = f"{abs(out_diff_b) / netstat_phys_out * 100.0:.2f}%" if netstat_phys_out > 0 else ("0.00% (ref=0)" if chrono_ext_out == 0 else "n/a (ref=0)")
+
+print(f"  -> [Offline 60s Physical NIC Calibration (TR4, no internet, lo0 excluded)] span={span_s}s ({len(ticks)-1} intervals @ 2s), phys_ifaces={','.join(ifaces) if ifaces else 'none'}, reference=netstat -ib (-n numeric)")
+print(f"  -> Inbound  (60s): chrono_ext_in={chrono_ext_in} B vs netstat_phys_in={netstat_phys_in} B | diff={in_diff_b:+d} B ({in_pct_str})")
+print(f"  -> Outbound (60s): chrono_ext_out={chrono_ext_out} B vs netstat_phys_out={netstat_phys_out} B | diff={out_diff_b:+d} B ({out_pct_str})")
+print(f"  -> Loopback (60s): netstat_lo0_in={netstat_lo0_in} B, chrono_peak_loopback_in_bps={peak_loop_in} B/s, loopback_rows_in_external_ledger={loop_sock_rows}")
+
+if peak_loop_in < 8 * 1024 * 1024 or loop_sock_rows != 0:
+    print(f"FAIL [Row 4 Offline 60s]: 64 MiB loopback burst not isolated (peak_loop_in={peak_loop_in}, loop_sock_rows={loop_sock_rows})! (uptime: {current_uptime_str()})", file=sys.stderr)
+    sys.exit(1)
+
+for direction, chrono_b, ref_b in (("inbound", chrono_ext_in, netstat_phys_in), ("outbound", chrono_ext_out, netstat_phys_out)):
+    tol = min(20 * 1024 * 1024, max(16 * 1024, int(ref_b * 0.15)))
+    diff_b = chrono_b - ref_b
+    pct = f"{abs(diff_b) / ref_b * 100.0:.2f}%" if ref_b > 0 else "n/a (ref=0)"
+    if ref_b >= 2048 and chrono_b <= 0:
+        print(f"FAIL [Row 4 Offline 60s]: Product external {direction} reported 0 B while netstat -ib physical NIC gained {ref_b} B! (uptime: {current_uptime_str()})", file=sys.stderr)
+        sys.exit(1)
+    if chrono_b < ref_b - tol or chrono_b > ref_b + tol:
+        print(f"FAIL [Row 4 Offline 60s]: Product external {direction} ({chrono_b} B) out of bounds vs netstat -ib ({ref_b} B, diff={diff_b:+d} B / {pct}, tol=±{tol} B)! (uptime: {current_uptime_str()})", file=sys.stderr)
+        sys.exit(1)
+
+print("  -> [PASS] Offline 60s physical NIC differential check passed within two-sided bounds (lo0 strictly excluded).")
+PY
+    if pgrep -f "$WORK_BIN" >/dev/null 2>&1; then
+        echo "FAIL: Lingering ChronoMac process found after 60s offline NIC check!" >&2
+        exit 1
+    fi
+}
+
+if [[ "$OFFLINE_NIC_60S_ONLY" -eq 1 ]]; then
+    echo "========================================================================"
+    echo "ChronoMac TR4 Offline 60s Physical NIC vs netstat -ib Verification"
+    echo "========================================================================"
+    echo "Load Start: $(/usr/bin/uptime | sed 's/^[[:space:]]*//')"
+    run_offline_60s_nic_calibration
+    if [[ -n "$BEFORE_LA_SNAP" ]]; then
+        AFTER_LA_SNAP="$(ls -1A "$REAL_LA_DIR" | shasum -a 256 | awk '{print $1}')"
+        if [[ "$BEFORE_LA_SNAP" != "$AFTER_LA_SNAP" ]]; then
+            echo "CRITICAL FAIL: Host ~/Library/LaunchAgents directory changed!" >&2
+            exit 1
+        fi
+    fi
+    exit 0
+fi
 
 # Compile deterministic 1-core CPU burner helper (`chronomac_cpu_burn_probe`) for Row 5
 cat > "$TMP_DIFF/chronomac_cpu_burn_probe.c" <<'EOF'
@@ -495,7 +724,13 @@ PY
     # --------------------------------------------------------------------
     echo ""
     /usr/bin/python3 - "$DB_PATH" "$OVERHEAD_CSV" "$REF_CSV" "$NETSTAT_START_JSON" "$LOOP_META" "$ROOT/README.md" "$ROOT/README.zh-CN.md" "$DURATION" "$INTERVAL" <<'PY'
-import csv, json, math, os, re, sqlite3, sys
+import csv, json, math, os, re, sqlite3, subprocess, sys
+
+def current_uptime_str():
+    try:
+        return subprocess.check_output(["/usr/bin/uptime"], text=True).strip()
+    except Exception:
+        return "unavailable"
 
 db_path, overhead_csv, ref_csv, netstat_start_path, loop_meta_path, readme_en_path, readme_zh_path, duration, interval = (
     sys.argv[1],
@@ -605,13 +840,14 @@ print(f"  -> Measured tree CPU:       avg={avg_tree_cpu:.2f}%, max={max_tree_cpu
 print(f"  -> Measured memory:         phys_footprint mean={mean_fp_mib:.2f} MiB, max={max_fp_mib:.2f} MiB | RSS mean={mean_rss_mib:.2f} MiB, max={max_rss_mib:.2f} MiB")
 
 if avg_self_cpu > ceil_self_cpu or avg_tree_cpu > ceil_tree_cpu or max_fp_mib > ceil_fp_mib:
-    print("FAIL [Row 2]: Recorder self-overhead exceeded README documented ceiling!", file=sys.stderr)
+    print(f"FAIL [Row 2]: Recorder self-overhead exceeded README documented ceiling! (uptime: {current_uptime_str()})", file=sys.stderr)
     sys.exit(1)
 print("  -> [PASS] Row 2: Recorder CPU and memory stayed strictly within README documented bounds.")
 
 # --- Row 3: Differential check across >= 300 2s points (CPU, Memory, Swap, Network) ---
 print("")
 print(f"[Row 3/6] Differential verification vs macOS built-ins ({expected_points} target points @ {int(interval)}s)...")
+print("  -> Reference substitution note (TR3): M1 table Row 3 names `top`; replaced here with phase-locked `/usr/sbin/iostat -n 0 -C -w 2 -c 2` because macOS `top -l` spends ~0.9s/sample traversing Mach VM regions (stretching `top -s 2` to ~2.9s/sample and drifting out of phase with 2.0s ticks).")
 refs = []
 with open(ref_csv, encoding="utf-8") as f:
     for row in csv.DictReader(f):
@@ -692,8 +928,16 @@ swap_pass_pct = swap_ok / n_pts * 100.0
 joint_pass_pct = joint_ok / n_pts * 100.0
 
 # Network physical NIC differential + 200 MiB loopback isolation verification over exact aligned span
-chrono_ext_in = sum(int(t_row[4] * interval) for (t_row, _, _) in aligned)
-chrono_ext_out = sum(int(t_row[5] * interval) for (t_row, _, _) in aligned)
+first_aligned_ts = aligned[0][0][0]
+last_aligned_ts = aligned[-1][0][0]
+chrono_ext_in = 0
+chrono_ext_out = 0
+for idx in range(1, len(ticks)):
+    t_ts = ticks[idx][0]
+    if first_aligned_ts <= t_ts <= last_aligned_ts:
+        dt_tick = max(1.0, float(t_ts - ticks[idx - 1][0]))
+        chrono_ext_in += int(round(float(ticks[idx][4]) * dt_tick))
+        chrono_ext_out += int(round(float(ticks[idx][5]) * dt_tick))
 peak_loop_in = max((t[6] for t in ticks), default=0)
 peak_loop_out = max((t[7] for t in ticks), default=0)
 
@@ -709,6 +953,10 @@ else:
     ref_lo_in_delta = max(0, refs[-1]["lo_in"] - refs[0]["lo_in"]) if len(refs) >= 2 else 0
 
 loop_meta = json.load(open(loop_meta_path, encoding="utf-8"))
+in_diff_b = chrono_ext_in - ref_ext_in_delta
+out_diff_b = chrono_ext_out - ref_ext_out_delta
+in_diff_pct = f"{abs(in_diff_b) / ref_ext_in_delta * 100.0:.2f}%" if ref_ext_in_delta > 0 else "n/a (ref=0)"
+out_diff_pct = f"{abs(out_diff_b) / ref_ext_out_delta * 100.0:.2f}%" if ref_ext_out_delta > 0 else "n/a (ref=0)"
 
 print(f"  -> Aligned 2s points: {n_pts}")
 print(f"  -> CPU vs iostat:     within_10pp={cpu_ok}/{n_pts} ({cpu_pass_pct:.2f}%) | mean={sum(cpu_diffs)/n_pts:.2f} pp, p95={p95(cpu_diffs):.2f} pp, max={max(cpu_diffs):.2f} pp")
@@ -716,19 +964,34 @@ print(f"  -> Memory vs vm_stat: within_10%={mem_ok}/{n_pts} ({mem_pass_pct:.2f}%
 print(f"  -> Swap vs sysctl:    within_10%={swap_ok}/{n_pts} ({swap_pass_pct:.2f}%) | mean={sum(swap_errs)/n_pts:.2f}%, p95={p95(swap_errs):.2f}%, max={max(swap_errs):.2f}%")
 print(f"  -> Joint (all 3 <=10% simultaneously): {joint_ok}/{n_pts} ({joint_pass_pct:.2f}%)")
 print(f"  -> Network & Loopback isolation: 200 MiB 127.0.0.1 probe sent={loop_meta['sent_bytes']} B, netstat_lo0_delta={ref_lo_in_delta} B, chrono_peak_loopback_in_bps={peak_loop_in} B/s, loopback_sockets_in_ledger={loop_sockets}, loopback_anomalies={loop_anoms}")
-print(f"  -> Physical NIC external bytes: chrono_in={chrono_ext_in} B vs netstat_in={ref_ext_in_delta} B | chrono_out={chrono_ext_out} B vs netstat_out={ref_ext_out_delta} B")
+print(f"  -> Physical NIC external bytes: chrono_in={chrono_ext_in} B vs netstat_in={ref_ext_in_delta} B (diff={in_diff_b:+d} B, {in_diff_pct}) | chrono_out={chrono_ext_out} B vs netstat_out={ref_ext_out_delta} B (diff={out_diff_b:+d} B, {out_diff_pct})")
 
 if cpu_pass_pct < 95.0 or mem_pass_pct < 95.0 or swap_pass_pct < 95.0 or joint_pass_pct < 95.0:
-    print("FAIL [Row 3]: Differential accuracy fell below 95.0% threshold!", file=sys.stderr)
+    print(f"FAIL [Row 3]: Differential accuracy fell below 95.0% threshold! (uptime: {current_uptime_str()})", file=sys.stderr)
     sys.exit(1)
 if peak_loop_in < 15 * 1024 * 1024 or loop_sockets != 0 or loop_anoms != 0:
-    print("FAIL [Row 3]: 200 MiB loopback transfer was not properly isolated from external socket ledger/anomalies!", file=sys.stderr)
-    sys.exit(1)
-if chrono_ext_in > ref_ext_in_delta + 20 * 1024 * 1024:
-    print("FAIL [Row 3]: Loopback leaked into external physical NIC inbound totals!", file=sys.stderr)
+    print(f"FAIL [Row 3]: 200 MiB loopback transfer was not properly isolated from external socket ledger/anomalies! (uptime: {current_uptime_str()})", file=sys.stderr)
     sys.exit(1)
 
-print("  -> [PASS] Row 3: >= 95% of 2s differential points within <= 10% across CPU, Memory, and Swap (with loopback strictly excluded from external NIC totals).")
+def verify_nic_two_sided_bounds(direction, chrono_b, ref_b):
+    upper_tol = min(20 * 1024 * 1024, max(16 * 1024, int(ref_b * 0.15)))
+    lower_tol = max(16 * 1024, int(ref_b * 0.15))
+    diff_b = chrono_b - ref_b
+    pct_str = f"{abs(diff_b) / ref_b * 100.0:.2f}%" if ref_b > 0 else "n/a (ref=0)"
+    if ref_b >= 2048 and chrono_b <= 0:
+        print(f"FAIL [Row 3]: Product external {direction} reported 0 B while netstat -ibn physical NIC gained {ref_b} B! (uptime: {current_uptime_str()})", file=sys.stderr)
+        sys.exit(1)
+    if chrono_b < ref_b - lower_tol:
+        print(f"FAIL [Row 3]: Product external {direction} ({chrono_b} B) fell below lower bound vs netstat -ibn ({ref_b} B, diff={diff_b:+d} B / {pct_str})! (uptime: {current_uptime_str()})", file=sys.stderr)
+        sys.exit(1)
+    if chrono_b > ref_b + upper_tol:
+        print(f"FAIL [Row 3]: Product external {direction} ({chrono_b} B) exceeded upper bound vs netstat -ibn ({ref_b} B, diff={diff_b:+d} B / {pct_str})! (uptime: {current_uptime_str()})", file=sys.stderr)
+        sys.exit(1)
+
+verify_nic_two_sided_bounds("inbound", chrono_ext_in, ref_ext_in_delta)
+verify_nic_two_sided_bounds("outbound", chrono_ext_out, ref_ext_out_delta)
+
+print("  -> [PASS] Row 3: >= 95% of 2s differential points within <= 10% across CPU, Memory, and Swap (with two-sided physical NIC bounds and loopback isolation verified).")
 PY
     PASSED=$((PASSED + 3))
 
@@ -738,7 +1001,8 @@ PY
     echo ""
     echo "[Row 4/6] 40 MB physical NIC download calibration & Unattributed residual..."
     swift test --skip-build --no-parallel --filter "ChronoMacCoreTests.SamplerTests/m1PhysicalNICCalibrationFortyMBAndLoopbackIsolation" >/dev/null
-    echo "  -> Deterministic 40 MB physical NIC calibration unit test: PASS (0.0% error vs netstat -ib, 90.0% on curl, 4 MB in Unattributed/未归属, 0 B smeared onto apsd)."
+    echo "  -> [Synthetic Fixture Unit Test] 40 MB physical NIC calibration: PASS (0.0% error vs netstat -ib, 90.0% on curl, +4 MB in Unattributed/未归属, 0 B smeared onto apsd; negative discrepancy guarded by tr2OverAttributedPerPIDTrafficPreservesNegativeDiscrepancyWithoutClampingToZero)."
+    run_offline_60s_nic_calibration
     if [[ -n "${CHRONOMAC_LIVE_DOWNLOAD_URL:-}" ]]; then
         DL_DB="$TMP_DIFF/row4-live.sqlite"
         PRE_IB="$(/usr/sbin/netstat -ibn)"
@@ -834,7 +1098,7 @@ PY
     # M1 Fault-Injection Mutation Gate (4 M1 Mutations in Isolated Clone)
     # --------------------------------------------------------------------
     echo ""
-    echo "[Mutation Gate] Verifying 4 M1 fault-injection mutations in isolated temp workspace..."
+    echo "[Mutation Gate] Verifying 6 M1 fault-injection mutations in isolated temp workspace..."
     MUT_REPO="$TMP_DIFF/mut-repo"
     mkdir -p "$MUT_REPO"
     /usr/bin/rsync -a --exclude='.build' --exclude='build' --exclude='.git' "$ROOT/" "$MUT_REPO/"
@@ -854,8 +1118,14 @@ import sys
 path, mode = sys.argv[1], sys.argv[2]
 text = open(path, encoding="utf-8").read()
 if mode == "m1_nic_drop_unattributed":
-    old = "unattributedInBytes = max(0, nicDeltaInBytes - attributedInBytes)"
+    old = "unattributedInBytes = nicDeltaInBytes - attributedInBytes"
     new = "unattributedInBytes = 0"
+elif mode == "m1_nic_clamp_negative_discrepancy":
+    old = "unattributedInBytes = nicDeltaInBytes - attributedInBytes"
+    new = "unattributedInBytes = max(0, nicDeltaInBytes - attributedInBytes)"
+elif mode == "m1_nic_zero_external":
+    old = "totalExtInBps = Int64(Double(nicDeltaInBytes) / dt)"
+    new = "totalExtInBps = 0"
 elif mode == "m1_t7_disable_ps_supplement":
     old = "if let psRow = lazyPsSnapshot?[pid] {"
     new = "if false, let psRow = lazyPsSnapshot?[pid] {"
@@ -896,6 +1166,16 @@ PY
         "ChronoMacCoreTests.SamplerTests/m1PhysicalNICCalibrationFortyMBAndLoopbackIsolation" \
         "m1_nic_drop_unattributed"
 
+    run_m1_mutation "m1_nic_clamp_negative_discrepancy" \
+        "Sources/ChronoMacCore/Collectors/NettopDeltaParser.swift" \
+        "ChronoMacCoreTests.SamplerTests/tr2OverAttributedPerPIDTrafficPreservesNegativeDiscrepancyWithoutClampingToZero" \
+        "m1_nic_clamp_negative_discrepancy"
+
+    run_m1_mutation "m1_nic_zero_external" \
+        "Sources/ChronoMacCore/Collectors/NettopDeltaParser.swift" \
+        "ChronoMacCoreTests.SamplerTests/m1PhysicalNICCalibrationFortyMBAndLoopbackIsolation" \
+        "m1_nic_zero_external"
+
     run_m1_mutation "m1_t7_disable_ps_supplement" \
         "Sources/ChronoMacCore/Collectors/ProcessTreeSampler.swift" \
         "ChronoMacCoreTests.SamplerTests/t7NonRootReadsWindowServerAndRootCPUWhileKernelTaskStaysUnreadable" \
@@ -912,7 +1192,7 @@ PY
         "m1_record_skip_batch"
 
     rm -rf "$MUT_REPO"
-    echo "  -> [PASS] Mutation Gate: 4/4 M1 fault-injection mutations caught cleanly."
+    echo "  -> [PASS] Mutation Gate: 6/6 M1 fault-injection mutations caught cleanly."
 
     # --------------------------------------------------------------------
     # Host Safety Verification: ~/Library completely untouched

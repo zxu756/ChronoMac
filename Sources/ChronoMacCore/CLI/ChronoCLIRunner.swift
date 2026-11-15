@@ -190,19 +190,23 @@ public enum ChronoCLIRunner {
                 durationSeconds: options.durationSeconds,
                 installSignalHandlers: true
             )
+            let gaps = recorder.recordedGapCount
             if options.jsonOutput {
                 let payload: [String: Any] = [
                     "dbPath": store.dbPath,
                     "recordedTicks": count,
+                    "recordedGaps": gaps,
                     "intervalSeconds": options.intervalSeconds,
                     "maxDatabaseBytes": maxBytes,
                     "storageBytes": store.totalStorageBytes()
                 ]
                 stdout += encodeJSON(payload) + "\n"
             } else if lang == .zhHans {
-                stdout += "ChronoMac 后台录制已安全停止：共写入 \(count) 条采样 -> \(store.dbPath)（磁盘占用 \(ChronoFormatter.bytes(store.totalStorageBytes()))）\n"
+                let gapSuffix = gaps > 0 ? "（记录缺口 \(gaps) 条）" : ""
+                stdout += "ChronoMac 后台录制已安全停止：共写入 \(count) 条采样\(gapSuffix) -> \(store.dbPath)（磁盘占用 \(ChronoFormatter.bytes(store.totalStorageBytes()))）\n"
             } else {
-                stdout += "ChronoMac recorder stopped cleanly: wrote \(count) ticks -> \(store.dbPath) (storage \(ChronoFormatter.bytes(store.totalStorageBytes())))\n"
+                let gapSuffix = gaps > 0 ? ", recorded \(gaps) gap(s)" : ""
+                stdout += "ChronoMac recorder stopped cleanly: wrote \(count) ticks\(gapSuffix) -> \(store.dbPath) (storage \(ChronoFormatter.bytes(store.totalStorageBytes())))\n"
             }
             return 0
         } catch {
@@ -424,9 +428,11 @@ public enum ChronoCLIRunner {
                 let displayName = p.localizedName(in: .zhHans)
                 let cpuCol = padRight(p.formattedCPU(in: .zhHans), width: 12)
                 let memCol = padRight(p.isUnattributed ? "—" : ChronoFormatter.bytes(p.memoryFootprintBytes), width: 29)
-                let netCol = padRight(ChronoFormatter.rate(p.netOutBps + (p.isUnattributed ? p.netInBps : 0)), width: 11)
+                let netCol = padRight(p.formattedNetworkRate(outboundOnlyForProcesses: true), width: 11)
                 let stateCol = padRight(p.livenessLabel(in: .zhHans), width: 12)
-                let pathCol = p.isUnattributed ? "（物理网卡总表差额）" : (p.execPath.isEmpty ? "（路径不可用）" : ChronoFormatter.displayPath(p.execPath))
+                let pathCol = p.hasNegativeNICDiscrepancy
+                    ? "（对不上的量：进程之和超物理网卡）"
+                    : (p.isUnattributed ? "（物理网卡总表差额）" : (p.execPath.isEmpty ? "（路径不可用）" : ChronoFormatter.displayPath(p.execPath)))
                 let pidCol = padRight(p.isUnattributed ? "—" : String(p.pid), width: 7)
                 let nameCol = padRight(displayName, width: 24)
                 lines.append("  \(pidCol) \(nameCol) \(cpuCol) \(memCol) \(netCol) \(stateCol) \(pathCol)")
@@ -444,9 +450,11 @@ public enum ChronoCLIRunner {
                 let nameCol = padRight(displayName, width: 25)
                 let cpuCol = padRight(p.formattedCPU(in: .en), width: 14)
                 let memCol = padRight(p.isUnattributed ? "—" : ChronoFormatter.bytes(p.memoryFootprintBytes), width: 34)
-                let netCol = padRight(ChronoFormatter.rate(p.netOutBps + (p.isUnattributed ? p.netInBps : 0)), width: 12)
+                let netCol = padRight(p.formattedNetworkRate(outboundOnlyForProcesses: true), width: 12)
                 let stateCol = padRight(p.livenessLabel(in: .en), width: 19)
-                let pathCol = p.isUnattributed ? "(physical NIC residual)" : (p.execPath.isEmpty ? "(path unavailable)" : ChronoFormatter.displayPath(p.execPath))
+                let pathCol = p.hasNegativeNICDiscrepancy
+                    ? "(unmatched delta: per-PID sum > physical NIC)"
+                    : (p.isUnattributed ? "(physical NIC residual)" : (p.execPath.isEmpty ? "(path unavailable)" : ChronoFormatter.displayPath(p.execPath)))
                 lines.append("  \(pidCol) \(nameCol) \(cpuCol) \(memCol) \(netCol) \(stateCol) \(pathCol)")
             }
         }
@@ -491,6 +499,7 @@ public enum ChronoCLIRunner {
         }
 
         let ticks = store.queryTicks(from: startTs, to: endTs)
+        let samplingGaps = store.querySamplingGaps(from: startTs, to: endTs)
         let livePIDs = sampler.currentLivePIDs()
         let procs = store.queryHistoricalProcesses(
             from: startTs,
@@ -528,11 +537,20 @@ public enum ChronoCLIRunner {
                 d["peakCPUPct"] = (p.isCPUReadable && !p.isUnattributed) ? roundToTenth(p.cpuPct) : NSNull()
                 return d
             }
+            let gapItems: [[String: Any]] = samplingGaps.map { g in
+                [
+                    "timestamp": g.ts,
+                    "isoTimestamp": ChronoFormatter.isoTimestamp(g.ts),
+                    "reason": g.reason
+                ]
+            }
             let payload: [String: Any] = [
                 "fromTimestamp": startTs,
                 "toTimestamp": endTs,
                 "sampleCount": ticks.count,
                 "maxGapSeconds": maxGap,
+                "recordedGapCount": samplingGaps.count,
+                "samplingGaps": gapItems,
                 "sortBy": options.sortOrder.rawValue,
                 "processes": procItems
             ]
@@ -545,6 +563,9 @@ public enum ChronoCLIRunner {
             lines.append(
                 "ChronoMac 历史进程归档（\(ChronoFormatter.isoTimestamp(startTs)) .. \(ChronoFormatter.isoTimestamp(endTs)) · \(ticks.count) 条系统采样 · 最大间隔 \(maxGap) 秒）"
             )
+            if !samplingGaps.isEmpty {
+                lines.append("  采样缺口记录：\(samplingGaps.count) 条（最近：\(ChronoFormatter.isoTimestamp(samplingGaps.last!.ts)) — \(samplingGaps.last!.reason)）")
+            }
             if procs.isEmpty {
                 lines.append("窗口内无匹配的进程历史记录。")
             } else {
@@ -557,9 +578,11 @@ public enum ChronoCLIRunner {
                     let nameCol = padRight(displayName, width: 24)
                     let cpuCol = padRight(p.formattedCPU(in: .zhHans), width: 13)
                     let memCol = padRight(p.isUnattributed ? "—" : ChronoFormatter.bytes(p.memoryFootprintBytes), width: 29)
-                    let netCol = padRight(ChronoFormatter.rate(p.netInBps + p.netOutBps), width: 11)
+                    let netCol = padRight(p.formattedNetworkRate(outboundOnlyForProcesses: false), width: 11)
                     let stateCol = padRight(p.livenessLabel(in: .zhHans), width: 12)
-                    let pathCol = p.isUnattributed ? "（物理网卡总表差额）" : (p.execPath.isEmpty ? "（路径不可用）" : ChronoFormatter.displayPath(p.execPath))
+                    let pathCol = p.hasNegativeNICDiscrepancy
+                        ? "（对不上的量：进程之和超物理网卡）"
+                        : (p.isUnattributed ? "（物理网卡总表差额）" : (p.execPath.isEmpty ? "（路径不可用）" : ChronoFormatter.displayPath(p.execPath)))
                     lines.append("  \(pidCol) \(nameCol) \(cpuCol) \(memCol) \(netCol) \(stateCol) \(pathCol)")
                 }
             }
@@ -567,6 +590,9 @@ public enum ChronoCLIRunner {
             lines.append(
                 "ChronoMac Historical Process Archive (\(ChronoFormatter.isoTimestamp(startTs)) .. \(ChronoFormatter.isoTimestamp(endTs)) · \(ticks.count) ticks · max gap \(maxGap)s)"
             )
+            if !samplingGaps.isEmpty {
+                lines.append("  Recorded sampling gaps: \(samplingGaps.count) (latest: \(ChronoFormatter.isoTimestamp(samplingGaps.last!.ts)) — \(samplingGaps.last!.reason))")
+            }
             if procs.isEmpty {
                 lines.append("No matching historical process snapshots in this window.")
             } else {
@@ -579,9 +605,11 @@ public enum ChronoCLIRunner {
                     let nameCol = padRight(displayName, width: 25)
                     let cpuCol = padRight(p.formattedCPU(in: .en), width: 14)
                     let memCol = padRight(p.isUnattributed ? "—" : ChronoFormatter.bytes(p.memoryFootprintBytes), width: 34)
-                    let netCol = padRight(ChronoFormatter.rate(p.netInBps + p.netOutBps), width: 12)
+                    let netCol = padRight(p.formattedNetworkRate(outboundOnlyForProcesses: false), width: 12)
                     let stateCol = padRight(p.livenessLabel(in: .en), width: 19)
-                    let pathCol = p.isUnattributed ? "(physical NIC residual)" : (p.execPath.isEmpty ? "(path unavailable)" : ChronoFormatter.displayPath(p.execPath))
+                    let pathCol = p.hasNegativeNICDiscrepancy
+                        ? "(unmatched delta: per-PID sum > physical NIC)"
+                        : (p.isUnattributed ? "(physical NIC residual)" : (p.execPath.isEmpty ? "(path unavailable)" : ChronoFormatter.displayPath(p.execPath)))
                     lines.append("  \(pidCol) \(nameCol) \(cpuCol) \(memCol) \(netCol) \(stateCol) \(pathCol)")
                 }
             }
@@ -712,7 +740,9 @@ public enum ChronoCLIRunner {
             for f in flows {
                 let procName = f.localizedProcessName(in: .zhHans)
                 let host = f.localizedEndpoint(in: .zhHans)
-                let pathLabel = f.isUnattributed ? "（物理网卡总表差额）" : (f.execPath.isEmpty ? "（路径不可用）" : ChronoFormatter.displayPath(f.execPath))
+                let pathLabel = f.hasNegativeNICDiscrepancy
+                    ? "（对不上的量：进程之和超物理网卡）"
+                    : (f.isUnattributed ? "（物理网卡总表差额）" : (f.execPath.isEmpty ? "（路径不可用）" : ChronoFormatter.displayPath(f.execPath)))
                 lines.append(
                     "  \(procName) -> \(host) | 上行: \(ChronoFormatter.bytes(f.totalBytesOut)) | 下行: \(ChronoFormatter.bytes(f.totalBytesIn)) | 路径: \(pathLabel)"
                 )
@@ -722,7 +752,9 @@ public enum ChronoCLIRunner {
             for f in flows {
                 let procName = f.localizedProcessName(in: .en)
                 let host = f.localizedEndpoint(in: .en)
-                let pathLabel = f.isUnattributed ? "(physical NIC residual)" : (f.execPath.isEmpty ? "(path unavailable)" : ChronoFormatter.displayPath(f.execPath))
+                let pathLabel = f.hasNegativeNICDiscrepancy
+                    ? "(unmatched delta: per-PID sum > physical NIC)"
+                    : (f.isUnattributed ? "(physical NIC residual)" : (f.execPath.isEmpty ? "(path unavailable)" : ChronoFormatter.displayPath(f.execPath)))
                 lines.append(
                     "  \(procName) -> \(host) | Out: \(ChronoFormatter.bytes(f.totalBytesOut)) | In: \(ChronoFormatter.bytes(f.totalBytesIn)) | Path: \(pathLabel)"
                 )

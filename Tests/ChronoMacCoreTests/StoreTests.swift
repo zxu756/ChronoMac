@@ -1,9 +1,39 @@
 import ChronoMacCore
+import Darwin
 import Foundation
 import Testing
 
 @Suite("Store Tests", .timeLimit(.minutes(1)))
 struct StoreTests {
+    static func formatTimingFailureDiagnostic(elapsedMs: Double, ceilingMs: Double) -> String {
+        var loads = [Double](repeating: 0, count: 3)
+        let gotLoad = getloadavg(&loads, 3)
+        let loadAvgStr = gotLoad == 3
+            ? String(format: "%.2f %.2f %.2f", loads[0], loads[1], loads[2])
+            : "unavailable"
+        var uptimeStr = "unavailable"
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/uptime")
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+        if (try? proc.run()) != nil {
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            if let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !text.isEmpty {
+                uptimeStr = text
+            }
+        }
+        return String(
+            format: "pruneElapsedMs=%.1fms exceeded < %.1fms ceiling (loadavg=[%@], uptime: %@)",
+            elapsedMs,
+            ceilingMs,
+            loadAvgStr,
+            uptimeStr
+        )
+    }
+
     private static func onDiskStorageBytes(at dbURL: URL) -> Int64 {
         let fm = FileManager.default
         let paths = [dbURL.path, dbURL.path + "-wal", dbURL.path + "-shm"]
@@ -571,7 +601,10 @@ struct StoreTests {
 
         let afterBytes = Self.onDiskStorageBytes(at: dbURL)
         #expect(afterBytes <= twoMB)
-        #expect(pruneElapsedMs < 1_500.0)
+        let pruneDiag = pruneElapsedMs >= 1_500.0
+            ? Self.formatTimingFailureDiagnostic(elapsedMs: pruneElapsedMs, ceilingMs: 1_500.0)
+            : ""
+        #expect(pruneElapsedMs < 1_500.0, Comment(rawValue: pruneDiag))
 
         // Global oldest-first MUST preserve the brand-new anomaly and brand-new socket flow!
         let survivingAnomalies = store.queryAnomalies(sinceTs: baseTs, limit: 10)
@@ -584,5 +617,30 @@ struct StoreTests {
         let survivingTicks = store.queryTicks(from: baseTs, to: recentTs + 2)
         #expect(survivingTicks.last?.ts == recentTs)
         #expect((survivingTicks.first?.ts ?? 0) > baseTs)
+    }
+
+    @Test("TR5: StoreTests prune timing failure attaches host uptime/loadavg without relaxing <1500ms, and m0-acceptance.sh resample prints measured diff without causal diagnosis")
+    func tr5PruneFailurePrintsHostLoadAndM0ResampleReportsMeasuredDiffWithoutCauseDiagnosis() throws {
+        let thisFileURL = URL(fileURLWithPath: #filePath)
+        let repoRoot = thisFileURL
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+
+        let storeTestsText = try String(contentsOf: thisFileURL, encoding: .utf8)
+        // Threshold < 1_500.0 must remain strictly un-relaxed and carry load diagnostic comment
+        #expect(storeTestsText.contains("#expect(pruneElapsedMs < 1_500.0, Comment(rawValue: pruneDiag))"))
+        #expect(storeTestsText.contains("/usr/bin/uptime"))
+
+        let m0ScriptURL = repoRoot.appendingPathComponent("Scripts/acceptance/m0-acceptance.sh")
+        let m0Text = try String(contentsOf: m0ScriptURL, encoding: .utf8)
+        #expect(!m0Text.contains("transient load spike"))
+        #expect(!m0Text.contains("'SPIKE'"))
+        #expect(m0Text.contains("measured diff=${DIFF_CPU} pp"))
+
+        let diag = Self.formatTimingFailureDiagnostic(elapsedMs: 1_820.5, ceilingMs: 1_500.0)
+        #expect(diag.contains("pruneElapsedMs=1820.5ms exceeded < 1500.0ms ceiling"))
+        #expect(diag.contains("loadavg=["))
+        #expect(!diag.contains("uptime: unavailable"))
     }
 }

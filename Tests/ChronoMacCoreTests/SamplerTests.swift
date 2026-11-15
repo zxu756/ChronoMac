@@ -939,4 +939,128 @@ struct SamplerTests {
         }
         #expect(loopbackAnomalies.isEmpty)
     }
+
+    @Test("TR2: When per-PID attributed network bytes exceed physical NIC delta, negative discrepancy is preserved and labeled 对不上的量 instead of clamping to 0")
+    func tr2OverAttributedPerPIDTrafficPreservesNegativeDiscrepancyWithoutClampingToZero() throws {
+        let nic1 = PhysicalNICCounterSnapshot(interfaces: [
+            "en0": PhysicalNICInterfaceCounters(
+                name: "en0",
+                isLoopback: false,
+                isPhysicalExternal: true,
+                bytesIn: 100_000_000,
+                bytesOut: 20_000_000
+            )
+        ])
+        // Over dt = 2.0s: physical NIC gained +30,000,000 B in / +50,000 B out,
+        // while per-PID nettop reported +36,000,000 B in / +80,000 B out on curl.999.
+        let nic2 = PhysicalNICCounterSnapshot(interfaces: [
+            "en0": PhysicalNICInterfaceCounters(
+                name: "en0",
+                isLoopback: false,
+                isPhysicalExternal: true,
+                bytesIn: 130_000_000,
+                bytesOut: 20_050_000
+            )
+        ])
+
+        let tick1CSV = """
+        time,interface,state,bytes_in,bytes_out,
+        curl.999,,,1000000,10000,
+        tcp4 192.168.1.25:51001<->151.101.1.69:443,en0,Established,1000000,10000,
+        """
+        let tick2CSV = """
+        time,interface,state,bytes_in,bytes_out,
+        curl.999,,,37000000,90000,
+        tcp4 192.168.1.25:51001<->151.101.1.69:443,en0,Established,37000000,90000,
+        """
+
+        let parser = NettopDeltaParser()
+        _ = parser.ingestCSV(tick1CSV, now: 40_000.0, nicCounters: nic1)
+        let res = parser.ingestCSV(tick2CSV, now: 40_002.0, nicCounters: nic2)
+
+        #expect(res.totalInBps == 15_000_000)
+        #expect(res.totalOutBps == 25_000)
+        #expect(res.perPIDBytesInDelta[999] == 18_000_000)
+        #expect(res.perPIDBytesOutDelta[999] == 40_000)
+
+        // Negative discrepancy MUST NOT be truncated to 0!
+        #expect(res.unattributedInBytes == -6_000_000)
+        #expect(res.unattributedOutBytes == -30_000)
+        #expect(res.unattributedInBps == -3_000_000)
+        #expect(res.unattributedOutBps == -15_000)
+        #expect(res.perPIDBytesInDelta[NettopDeltaParser.unattributedPID] == -3_000_000)
+        #expect(res.perPIDBytesOutDelta[NettopDeltaParser.unattributedPID] == -15_000)
+
+        // Exact ledger conservation: sum of all per-PID rows (including negative discrepancy) == physical NIC rate
+        let sumInBps = res.perPIDBytesInDelta.values.reduce(0, +)
+        let sumOutBps = res.perPIDBytesOutDelta.values.reduce(0, +)
+        #expect(sumInBps == res.totalInBps)
+        #expect(sumOutBps == res.totalOutBps)
+
+        let unattrSock = try #require(res.externalSocketDeltas.first(where: { $0.pid == NettopDeltaParser.unattributedPID }))
+        #expect(unattrSock.deltaBytesIn == -6_000_000)
+        #expect(unattrSock.deltaBytesOut == -30_000)
+
+        // Verify ChronoFormatter formats negative bytes & rates with leading '-' instead of "0 MB" / "0 KB/s"
+        #expect(ChronoFormatter.bytes(-6_000_000).hasPrefix("-"))
+        #expect(ChronoFormatter.rate(-3_000_000).hasPrefix("-"))
+
+        // Verify ProcessTreeSampler + FlightboxStore preserve negative discrepancy and label it "对不上的量" in ZH
+        let sampler = ProcessTreeSampler()
+        let (procs, _, _, _) = sampler.sampleTopProcesses(
+            ts: 40_002,
+            netInBpsByPID: res.perPIDBytesInDelta,
+            netOutBpsByPID: res.perPIDBytesOutDelta,
+            limit: 30
+        )
+        let procUnattr = try #require(procs.first(where: { $0.pid == NettopDeltaParser.unattributedPID }))
+        #expect(procUnattr.netInBps == -3_000_000)
+        #expect(procUnattr.netOutBps == -15_000)
+        #expect(procUnattr.localizedName(in: .zhHans) == "对不上的量")
+
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("chronomac-tr2-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        let store = try FlightboxStore(databaseURL: tmpDir.appendingPathComponent("flightbox.sqlite"))
+        try store.recordSampleBatch(
+            tick: SystemTick(
+                ts: 40_002,
+                cpuUserPct: 10,
+                cpuSysPct: 3,
+                memUsedBytes: 8_000_000_000,
+                memTotalBytes: 16_000_000_000,
+                swapUsedBytes: 0,
+                diskReadBps: 0,
+                diskWriteBps: 0,
+                netInBps: res.totalInBps,
+                netOutBps: res.totalOutBps
+            ),
+            processes: [procUnattr],
+            sockets: [
+                SocketFlowRecord(
+                    bucketHour: (40_002 / 3600) * 3600,
+                    execPath: "",
+                    processName: NettopDeltaParser.unattributedProcessToken,
+                    remoteEndpoint: NettopDeltaParser.unattributedEndpoint,
+                    protocolName: "nic",
+                    totalBytesIn: unattrSock.deltaBytesIn,
+                    totalBytesOut: unattrSock.deltaBytesOut,
+                    firstSeen: 40_002,
+                    lastSeen: 40_002
+                )
+            ],
+            anomalies: []
+        )
+
+        let (_, queriedProcs) = store.queryNearestProcesses(at: 40_002, sortBy: .network)
+        let savedProc = try #require(queriedProcs.first(where: { $0.pid == NettopDeltaParser.unattributedPID }))
+        #expect(savedProc.netInBps == -3_000_000)
+        #expect(savedProc.netOutBps == -15_000)
+        #expect(savedProc.localizedName(in: .zhHans) == "对不上的量")
+
+        let queriedFlows = store.querySocketFlows(sinceTs: 40_000, limit: 10)
+        let savedFlow = try #require(queriedFlows.first(where: { $0.isUnattributed }))
+        #expect(savedFlow.totalBytesIn == -6_000_000)
+        #expect(savedFlow.totalBytesOut == -30_000)
+        #expect(savedFlow.localizedProcessName(in: .zhHans) == "对不上的量")
+    }
 }

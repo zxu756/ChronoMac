@@ -489,11 +489,13 @@ public struct ChronoDashboardView: View {
     private func processRow(_ p: ProcessSample) -> some View {
         let selected = !p.execPath.isEmpty && monitor.selectedProcessExecPath == p.execPath
         let hot = (p.isCPUReadable && p.cpuPct >= 150) || p.rssBytes >= 4_294_967_296 || p.netOutBps >= 5_242_880
-        let displayedPath = p.isUnattributed
-            ? localizer.L("Physical NIC delta minus per-PID sockets (non-root kernel_task PID 0 CPU requires root)", "物理网卡总表减进程套接字差额（非 root 下 kernel_task PID 0 CPU 无权限）")
-            : (p.execPath.isEmpty
-                ? localizer.L("(path unavailable · non-root kernel_task PID 0 CPU requires root)", "（路径不可用 · 非 root 下 kernel_task PID 0 CPU 需 root 权限）")
-                : ChronoFormatter.displayPath(p.execPath))
+        let displayedPath = p.hasNegativeNICDiscrepancy
+            ? localizer.L("Unmatched delta: per-PID socket sum exceeded physical NIC delta", "对不上的量：逐进程套接字之和超出物理网卡增量")
+            : (p.isUnattributed
+                ? localizer.L("Physical NIC delta minus per-PID sockets (non-root kernel_task PID 0 CPU requires root)", "物理网卡总表减进程套接字差额（非 root 下 kernel_task PID 0 CPU 无权限）")
+                : (p.execPath.isEmpty
+                    ? localizer.L("(path unavailable · non-root kernel_task PID 0 CPU requires root)", "（路径不可用 · 非 root 下 kernel_task PID 0 CPU 需 root 权限）")
+                    : ChronoFormatter.displayPath(p.execPath)))
 
         return Button(action: {
             guard !p.execPath.isEmpty else { return }
@@ -540,9 +542,9 @@ public struct ChronoDashboardView: View {
                     .foregroundStyle(p.rssBytes >= 4_294_967_296 ? ChronoTheme.playheadRed : ChronoTheme.ink)
                     .frame(width: 184, alignment: .trailing)
 
-                Text(ChronoFormatter.rate(p.netOutBps))
-                    .font(.system(size: 11, weight: p.netOutBps >= 5_242_880 ? .bold : .regular, design: .monospaced))
-                    .foregroundStyle(p.netOutBps >= 5_242_880 ? ChronoTheme.netPlum : ChronoTheme.muted)
+                Text(p.formattedNetworkRate(outboundOnlyForProcesses: true))
+                    .font(.system(size: 11, weight: abs(p.netOutBps) >= 5_242_880 || p.hasNegativeNICDiscrepancy ? .bold : .regular, design: .monospaced))
+                    .foregroundStyle(p.hasNegativeNICDiscrepancy ? ChronoTheme.playheadRed : (p.netOutBps >= 5_242_880 ? ChronoTheme.netPlum : ChronoTheme.muted))
                     .frame(width: 72, alignment: .trailing)
 
                 HStack {

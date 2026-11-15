@@ -20,8 +20,9 @@ public struct NettopSocketDelta: Sendable, Equatable {
         self.processName = processName
         self.protocolName = protocolName
         self.remoteEndpoint = remoteEndpoint
-        self.deltaBytesIn = max(0, deltaBytesIn)
-        self.deltaBytesOut = max(0, deltaBytesOut)
+        let allowSigned = (pid == NettopDeltaParser.unattributedPID || remoteEndpoint == NettopDeltaParser.unattributedEndpoint)
+        self.deltaBytesIn = allowSigned ? deltaBytesIn : max(0, deltaBytesIn)
+        self.deltaBytesOut = allowSigned ? deltaBytesOut : max(0, deltaBytesOut)
     }
 }
 
@@ -64,10 +65,10 @@ public struct NettopSnapshotResult: Sendable, Equatable {
         self.totalOutBps = max(0, totalOutBps)
         self.loopbackRxBytesPerSec = max(0, loopbackRxBytesPerSec)
         self.loopbackTxBytesPerSec = max(0, loopbackTxBytesPerSec)
-        self.unattributedInBytes = max(0, unattributedInBytes)
-        self.unattributedOutBytes = max(0, unattributedOutBytes)
-        self.unattributedInBps = max(0, unattributedInBps)
-        self.unattributedOutBps = max(0, unattributedOutBps)
+        self.unattributedInBytes = unattributedInBytes
+        self.unattributedOutBytes = unattributedOutBytes
+        self.unattributedInBps = unattributedInBps
+        self.unattributedOutBps = unattributedOutBps
     }
 }
 
@@ -335,18 +336,18 @@ public final class NettopDeltaParser: @unchecked Sendable {
                 let attributedInBytes = perPIDExtInBytes.values.reduce(0, +)
                 let attributedOutBytes = perPIDExtOutBytes.values.reduce(0, +)
 
-                unattributedInBytes = max(0, nicDeltaInBytes - attributedInBytes)
-                unattributedOutBytes = max(0, nicDeltaOutBytes - attributedOutBytes)
-                unattributedInBps = unattributedInBytes > 0 ? Int64(Double(unattributedInBytes) / dt) : 0
-                unattributedOutBps = unattributedOutBytes > 0 ? Int64(Double(unattributedOutBytes) / dt) : 0
+                unattributedInBytes = nicDeltaInBytes - attributedInBytes
+                unattributedOutBytes = nicDeltaOutBytes - attributedOutBytes
+                unattributedInBps = unattributedInBytes != 0 ? Int64(Double(unattributedInBytes) / dt) : 0
+                unattributedOutBps = unattributedOutBytes != 0 ? Int64(Double(unattributedOutBytes) / dt) : 0
 
-                if unattributedInBps > 0 {
+                if unattributedInBps != 0 {
                     perPIDExtInBps[Self.unattributedPID] = unattributedInBps
                 }
-                if unattributedOutBps > 0 {
+                if unattributedOutBps != 0 {
                     perPIDExtOutBps[Self.unattributedPID] = unattributedOutBps
                 }
-                if unattributedInBytes > 0 || unattributedOutBytes > 0 {
+                if unattributedInBytes != 0 || unattributedOutBytes != 0 {
                     sockDeltas.append(
                         NettopSocketDelta(
                             pid: Self.unattributedPID,

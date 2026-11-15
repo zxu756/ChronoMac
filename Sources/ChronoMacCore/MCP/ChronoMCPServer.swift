@@ -111,10 +111,12 @@ public final class ChronoMCPServer: Sendable {
             for p in procs.prefix(12) {
                 let procName = p.localizedName(in: .en)
                 let cpuStr = p.formattedCPU(in: .en)
-                let footprintStr = ChronoFormatter.bytes(p.memoryFootprintBytes)
-                let netOutStr = ChronoFormatter.rate(p.netOutBps)
+                let footprintStr = p.isUnattributed ? "—" : ChronoFormatter.bytes(p.memoryFootprintBytes)
+                let netOutStr = p.formattedNetworkRate(outboundOnlyForProcesses: true)
                 let livenessStr = p.livenessLabel(in: .en)
-                let pathStr = p.execPath.isEmpty ? "(path unavailable)" : ChronoFormatter.displayPath(p.execPath)
+                let pathStr = p.hasNegativeNICDiscrepancy
+                    ? "(unmatched delta: per-PID sum > physical NIC)"
+                    : (p.isUnattributed ? "(physical NIC residual)" : (p.execPath.isEmpty ? "(path unavailable)" : ChronoFormatter.displayPath(p.execPath)))
                 lines.append(
                     String(
                         format: "  PID %-6d %-24@ CPU %-13@ Memory Footprint (phys_footprint) %-10@ NetOut %-10@ [%@] %@",
