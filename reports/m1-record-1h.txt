@@ -1,26 +1,30 @@
 ========================================================================
 ChronoMac M1 Headless Continuous Recording & Self-Overhead Verification
 ========================================================================
-Date (UTC): 2026-11-15T04:43:29Z
+Date (UTC): 2026-11-15T19:11:46Z
 macOS:      27.0.1 (26A434) · arm64
+Load Start: 8:11  up 5 days, 22:42, 4 users, load averages: 5.96 4.69 3.99
 Command:    ChronoMac record --db <TMP_DIR>/flightbox-1h.sqlite --interval 2 --duration 3600 --max-db-mb 250 --no-dns
 
 [Recorder Exit]
-  exit_code=0, wall_elapsed_sec=3602s
-  stdout: ChronoMac 后台录制已安全停止：共写入 1801 条采样 -> <TMP_DIR>（磁盘占用 30.9 MB）
+  exit_code=0, wall_elapsed_sec=3603s
+  stdout: ChronoMac recorder stopped cleanly: wrote 1801 ticks -> <TMP_DIR>/flightbox-1h.sqlite (storage 26.6 MB)
 
 [Row 1 & Row 2 SQLite Gap & Self-Overhead Analysis]
+  readme_ceilings      = self_cpu_avg <= 2.0%, tree_cpu_avg <= 8.0%, phys_footprint <= 50.0 MiB, rss <= 60.0 MiB
   system_ticks_count   = 1801 (expected >= 1795)
-  process_snapshots    = 96837
-  span_seconds         = 3603s (min_ts=1794717811, max_ts=1794721414, expected >= 3594s)
-  inter_tick_gap_sec   = min=1s, avg=2.00s, max=5s, gaps_gt_10s=0
-  db_total_bytes       = 32378880 (30.88 MiB)
-  overhead_samples     = 1795
-  recorder_self_cpu    = avg=0.93%, max=6.50% (daemon process alone)
-  recorder_tree_cpu    = avg=4.64%, p95=6.08%, max=13.24% (daemon + nettop/ps/netstat children)
-  recorder_rss_mib     = mean=20.74 MiB, max=37.03 MiB
-  recorder_phys_fp_mib = mean=78.59 MiB, max=148.61 MiB
+  process_snapshots    = 95107
+  span_seconds         = 3600s (min_ts=1794769908, max_ts=1794773508, expected >= 3594s)
+  inter_tick_gap_sec   = min=1s, avg=2.00s, max=4s, gaps_gt_10s=0
+  db_total_bytes       = 27889664 (26.60 MiB)
+  overhead_samples     = 1796
+  recorder_self_cpu    = avg=0.89%, max=4.17% (daemon process alone)
+  recorder_tree_cpu    = avg=4.12%, p95=5.83%, max=10.29% (daemon + nettop/ps/netstat children)
+  recorder_rss_mib     = mean=18.68 MiB, max=20.67 MiB
+  recorder_phys_fp_mib = mean=7.72 MiB, max=11.64 MiB
+  host_uptime_end      = 9:11  up 5 days, 23:42, 3 users, load averages: 2.69 3.04 3.74
 
 [PASS] Row 1: Headless `ChronoMac record` wrote continuous 2s ticks with 0 gaps > 10s.
-[PASS] Row 2: Recorder self-overhead empirically measured (CPU% & phys_footprint/RSS MiB).
+[PASS] Row 2: Recorder CPU and memory stayed strictly within README documented bounds.
 Summary: passed=2, skipped=0, failed=0
+[Host Safety] Verified ~/Library/Application Support, Preferences, and LaunchAgents untouched; zero lingering recorder processes.
