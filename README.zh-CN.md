@@ -39,6 +39,7 @@
   - **10 分钟实测（加每拍 `autoreleasepool` 与 `PRAGMA cache_size = -4096` 修复后，`604s`、`303` 条采样，`reports/m1-differential.txt`）**：守护进程自身 CPU `avg=0.86%`（`max=3.94%`），含采样工具子进程总 CPU `avg=4.38%`（`max=11.05%`），`phys_footprint` `mean=8.26 MiB`（`max=13.05 MiB`），`RSS` `mean=17.51 MiB`（`max=22.62 MiB`）；300 个 2 秒对齐点与 `iostat`（`max=0.96 pp`）、`vm_stat`（`max=0.30%`）、`sysctl vm.swapusage`（`max=0.00%`）联合达标率 `300/300`（`100.00%`）。
   - **1 小时无界面连续录制实测（墙钟 `3,603s` / 跨度 `3,600s`、`1,801` 条采样、`95,107` 条进程快照、库大小 `26.60 MiB`、零 `> 10s` 空洞、`min_gap=1s`、`avg_gap=2.00s`、`max_gap=4s`，`reports/m1-record-1h.txt`）**：守护进程自身 CPU `avg=0.89%`（`max=4.17%`），含子进程树总 CPU `avg=4.12%`（`p95=5.83%`、`max=10.29%`），`phys_footprint` `mean=7.72 MiB`（`max=11.64 MiB`），`RSS` `mean=18.68 MiB`（`max=20.67 MiB`）。
 - **当前验证覆盖范围**：已完成 1 小时无界面连续录制（`Scripts/acceptance/m1-record-1h.sh`，`1,800` 条 2 秒采样，零 `> 10s` 空洞）与 10 分钟 300 点同机对账（`Scripts/acceptance/m1-differential.sh`，对比 `iostat`、`vm_stat`、`sysctl vm.swapusage` 与 `netstat -ibn`）。连续 7 天墙钟长跑（`M1 Row 6`）与真实外网 40 MB 下载（`M1 Row 4`，受离线不联网规则约束，默认由 `CHRONOMAC_LIVE_DOWNLOAD_URL` 显式开关保护）在 `reports/` 中如实标注。
+- **已知局限**：在一个采样间隔（2 秒）内就结束的下载，逐进程归属会偏低——实测一次 `0.66` 秒完成的 `40 MB` 下载，`74%`（`33,137,757 B / 44,789,812 B`）归到 `curl`，其余计入「未归属」；外联账本入站总量仍与物理网卡对得上（`44,789,812 B` 对 `44,790,871 B`，差 `-0.002%`）。此外，普通用户态下无法读取内核任务 `kernel_task`（`PID 0`）的 CPU（显示为 `无权限`），也无法读取其他 UID 进程的 Mach `ri_phys_footprint` 与单进程磁盘读写字节。
 - **规划中（M2）**：在已校准的后台飞行匣之上扩展因果归因（`chronomac why`）与会话联动工作流。
 
 详见 [docs/SPEC.md](docs/SPEC.md) 了解架构、表结构与指标口径说明。

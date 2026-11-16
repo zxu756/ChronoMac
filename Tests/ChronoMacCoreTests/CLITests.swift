@@ -1294,4 +1294,26 @@ struct CLITests {
         #expect(!failOut.contains("[PASS] Row 4"))
         #expect(failErr.contains("FAIL [Row 4]"))
     }
+
+    @Test("Row 4 Known Limitation: README.md and README.zh-CN.md document sub-2s download per-process attribution limitation with measured 0.66s / 74% figures")
+    func readmeDocumentsSubIntervalDownloadAttributionLimitation() throws {
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let readmeEN = try String(contentsOf: repoRoot.appendingPathComponent("README.md"), encoding: .utf8)
+        let readmeZH = try String(contentsOf: repoRoot.appendingPathComponent("README.zh-CN.md"), encoding: .utf8)
+
+        #expect(readmeEN.contains("Known Limitations"))
+        #expect(readmeEN.contains("0.66"))
+        #expect(readmeEN.contains("74%"))
+        #expect(readmeEN.contains("curl"))
+        #expect(readmeEN.contains("Unattributed"))
+
+        #expect(readmeZH.contains("已知局限"))
+        #expect(readmeZH.contains("0.66"))
+        #expect(readmeZH.contains("74%"))
+        #expect(readmeZH.contains("curl"))
+        #expect(readmeZH.contains("未归属"))
+    }
 }
