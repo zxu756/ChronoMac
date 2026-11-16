@@ -511,13 +511,13 @@ run_live_row4_download() {
     sleep 2
 
     local dl_t0
-    dl_t0="$(/usr/bin/python3 -c 'import time; print(f"{time.monotonic():.3f}")')"
+    dl_t0="$(/usr/bin/python3 -c 'import time; print(f"{time.time():.3f}")')"
     set +e
     /usr/bin/curl -q -fsSL --limit-rate 3M --max-time 45 -o "$dl_file" "$CHRONOMAC_LIVE_DOWNLOAD_URL"
     local curl_rc=$?
     set -e
     local dl_t1
-    dl_t1="$(/usr/bin/python3 -c 'import time; print(f"{time.monotonic():.3f}")')"
+    dl_t1="$(/usr/bin/python3 -c 'import time; print(f"{time.time():.3f}")')"
     local dl_elapsed
     dl_elapsed="$(/usr/bin/python3 -c "print(f'{max(0.0, float($dl_t1) - float($dl_t0)):.2f}')")"
 
