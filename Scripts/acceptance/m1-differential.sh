@@ -4,11 +4,153 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
+evaluate_row4_live_download() {
+    local egress_json_file="$1"
+    local pre_ib_file="$2"
+    local post_ib_file="$3"
+    local actual_file_bytes="$4"
+    local expected_file_bytes="$5"
+    local dl_elapsed_sec="${6:-0.0}"
+    /usr/bin/python3 - "$egress_json_file" "$pre_ib_file" "$post_ib_file" "$actual_file_bytes" "$expected_file_bytes" "$dl_elapsed_sec" <<'PY'
+# [Row 4 Live Download Evaluator]
+import json, os, re, subprocess, sys
+
+egress_path, pre_ib_path, post_ib_path = sys.argv[1], sys.argv[2], sys.argv[3]
+actual_bytes = int(sys.argv[4])
+expected_bytes = int(sys.argv[5])
+dl_elapsed_sec = float(sys.argv[6])
+
+def current_uptime_str():
+    try:
+        return subprocess.check_output(["/usr/bin/uptime"], text=True).strip()
+    except Exception:
+        return "unavailable"
+
+PHYS_EN_RE = re.compile(r"^en\d+$")
+
+def parse_netstat_en_ib(text):
+    en_ib = {}
+    en_ob = {}
+    for ln in text.splitlines():
+        cols = ln.split()
+        # Link-layer rows have `<Link#N>` at col 2; rows without an Address column have 10 fields
+        # and rows with a MAC Address column have 11 fields. Count from the end:
+        # cols[-5] = Ibytes, cols[-2] = Obytes.
+        if len(cols) < 10 or not cols[2].startswith("<Link#"):
+            continue
+        name = cols[0].rstrip("*").lower()
+        if not PHYS_EN_RE.match(name):
+            continue
+        try:
+            ib = int(cols[-5])
+            ob = int(cols[-2])
+        except ValueError:
+            continue
+        en_ib[name] = max(en_ib.get(name, 0), ib)
+        en_ob[name] = max(en_ob.get(name, 0), ob)
+    return en_ib, en_ob
+
+if expected_bytes <= 0 or actual_bytes <= 0 or actual_bytes != expected_bytes:
+    print(
+        f"FAIL [Row 4]: Downloaded file size mismatch: actual={actual_bytes} B vs expected={expected_bytes} B! (uptime: {current_uptime_str()})",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+pre_en_ib, _ = parse_netstat_en_ib(open(pre_ib_path, encoding="utf-8").read())
+post_en_ib, _ = parse_netstat_en_ib(open(post_ib_path, encoding="utf-8").read())
+
+all_en = sorted(set(pre_en_ib.keys()) | set(post_en_ib.keys()))
+per_iface_in = {k: post_en_ib.get(k, 0) - pre_en_ib.get(k, 0) for k in all_en}
+netstat_en_in_delta = sum(per_iface_in.values())
+active_en = [k for k, d in per_iface_in.items() if d != 0] or all_en
+
+egress_data = json.load(open(egress_path, encoding="utf-8"))
+flows = egress_data.get("flows")
+if not isinstance(flows, list):
+    print("FAIL [Row 4]: Invalid `--cli egress --json` payload (missing 'flows' list)!", file=sys.stderr)
+    sys.exit(1)
+
+ledger_in_bytes = 0
+curl_in_bytes = 0
+unattributed_in_bytes = 0
+for f in flows:
+    b_in = int(f.get("totalBytesIn", 0))
+    ledger_in_bytes += b_in
+    proc_name = str(f.get("processName", ""))
+    exec_path = str(f.get("execPath", ""))
+    exec_base = os.path.basename(exec_path) if exec_path else ""
+    is_unattr = bool(f.get("isUnattributed", False)) or proc_name in (
+        "Unattributed",
+        "未归属",
+        "Unmatched delta",
+        "对不上的量",
+    )
+    if is_unattr:
+        unattributed_in_bytes += b_in
+    elif proc_name.lower() == "curl" or exec_base.lower() == "curl":
+        curl_in_bytes += b_in
+
+if netstat_en_in_delta <= 0:
+    print(
+        f"FAIL [Row 4]: Physical en* NIC inbound delta from netstat -ibn must be > 0, got {netstat_en_in_delta} B! (uptime: {current_uptime_str()})",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+diff_bytes = ledger_in_bytes - netstat_en_in_delta
+signed_diff_pct = (float(diff_bytes) / float(netstat_en_in_delta)) * 100.0
+abs_diff_pct = abs(signed_diff_pct)
+curl_of_file_pct = (float(curl_in_bytes) / float(actual_bytes)) * 100.0
+curl_of_ledger_pct = (float(curl_in_bytes) / float(ledger_in_bytes) * 100.0) if ledger_in_bytes > 0 else 0.0
+unattr_of_ledger_pct = (float(unattributed_in_bytes) / float(ledger_in_bytes) * 100.0) if ledger_in_bytes > 0 else 0.0
+
+print("  -> [Live 40 MB External NIC Download] curl rate-limited via `--limit-rate 3M` so the 40 MiB download spans multiple 2s nettop sampling intervals (a sub-2s download closing inside a single interval under-attributes per-PID sockets into Unattributed).")
+print(f"  -> Download file:   actual={actual_bytes} B (expected={expected_bytes} B), elapsed={dl_elapsed_sec:.2f}s")
+print(f"  -> Physical NIC:    ifaces={','.join(active_en) if active_en else 'none'} (en* only; lo0/utun/bridge excluded), netstat_en_in_delta={netstat_en_in_delta} B")
+print(f"  -> Ledger vs NIC:   ledger_in={ledger_in_bytes} B vs netstat_en_in_delta={netstat_en_in_delta} B | diff={diff_bytes:+d} B ({signed_diff_pct:+.3f}%, abs={abs_diff_pct:.3f}%, ceiling <= 10.0%)")
+print(f"  -> Attribution:     curl_in={curl_in_bytes} B ({curl_of_file_pct:.2f}% of file [floor >= 80.0%], {curl_of_ledger_pct:.2f}% of ledger) | unattributed_in={unattributed_in_bytes} B ({unattr_of_ledger_pct:.2f}% of ledger)")
+
+if ledger_in_bytes <= 0:
+    print(
+        f"FAIL [Row 4]: Product external ledger inbound total reported {ledger_in_bytes} B while netstat -ibn en* gained {netstat_en_in_delta} B! (uptime: {current_uptime_str()})",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+if abs_diff_pct > 10.0:
+    print(
+        f"FAIL [Row 4]: External ledger inbound total ({ledger_in_bytes} B) differed from netstat -ibn en* delta ({netstat_en_in_delta} B) by {signed_diff_pct:+.2f}% (abs {abs_diff_pct:.2f}% > 10.0% ceiling)! (uptime: {current_uptime_str()})",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+if curl_of_file_pct < 80.0:
+    print(
+        f"FAIL [Row 4]: Inbound bytes attributed to curl ({curl_in_bytes} B) was {curl_of_file_pct:.2f}% of downloaded file ({actual_bytes} B), below 80.0% floor! (uptime: {current_uptime_str()})",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+print("  -> [PASS] Row 4: Live external 40 MB download verified (ledger vs netstat -ibn <= 10%, curl attribution >= 80% of file size).")
+PY
+}
+
+if [[ "${1:-}" == "--verify-row4-fixtures" ]]; then
+    if [[ $# -lt 5 ]]; then
+        echo "Usage: $0 --verify-row4-fixtures <egress.json> <pre_ib.txt> <post_ib.txt> <actual_bytes> [expected_bytes] [elapsed_sec]" >&2
+        exit 2
+    fi
+    evaluate_row4_live_download "$2" "$3" "$4" "$5" "${6:-41943040}" "${7:-13.30}"
+    exit $?
+fi
+
 DURATION=600
 INTERVAL=2
 OUTPUT_REPORT=""
 SKIP_BUILD=0
 OFFLINE_NIC_60S_ONLY=0
+LIVE_ROW4_ONLY=0
 TMP_ROOT_ARG=""
 
 while [[ $# -gt 0 ]]; do
@@ -33,6 +175,10 @@ while [[ $# -gt 0 ]]; do
             OFFLINE_NIC_60S_ONLY=1
             shift
             ;;
+        --row4-live-only)
+            LIVE_ROW4_ONLY=1
+            shift
+            ;;
         --tmp-root)
             TMP_ROOT_ARG="$2"
             shift 2
@@ -44,7 +190,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "$OFFLINE_NIC_60S_ONLY" -ne 1 ]] && [[ "$DURATION" -lt 36 ]]; then
+if [[ "$OFFLINE_NIC_60S_ONLY" -ne 1 ]] && [[ "$LIVE_ROW4_ONLY" -ne 1 ]] && [[ "$DURATION" -lt 36 ]]; then
     echo "Error: --duration must be >= 36 seconds to run CPU burner + loopback probes cleanly (got $DURATION)." >&2
     exit 2
 fi
@@ -121,6 +267,14 @@ fi
 REL_BIN="$ROOT/.build/release/ChronoMac"
 if [[ ! -x "$REL_BIN" ]]; then
     REL_BIN="$ROOT/.build/arm64-apple-macosx/release/ChronoMac"
+fi
+if [[ "$SKIP_BUILD" -eq 1 ]] && [[ ! -x "$REL_BIN" ]]; then
+    for cand in "$ROOT/.build/debug/ChronoMac" "$ROOT/.build/arm64-apple-macosx/debug/ChronoMac"; do
+        if [[ -x "$cand" ]]; then
+            REL_BIN="$cand"
+            break
+        fi
+    done
 fi
 if [[ ! -x "$REL_BIN" ]]; then
     swift build -c release --product ChronoMac >/dev/null
@@ -321,6 +475,144 @@ if [[ "$OFFLINE_NIC_60S_ONLY" -eq 1 ]]; then
     echo "========================================================================"
     echo "Load Start: $(/usr/bin/uptime | sed 's/^[[:space:]]*//')"
     run_offline_60s_nic_calibration
+    if [[ -n "$BEFORE_LA_SNAP" ]]; then
+        AFTER_LA_SNAP="$(ls -1A "$REAL_LA_DIR" | shasum -a 256 | awk '{print $1}')"
+        if [[ "$BEFORE_LA_SNAP" != "$AFTER_LA_SNAP" ]]; then
+            echo "CRITICAL FAIL: Host ~/Library/LaunchAgents directory changed!" >&2
+            exit 1
+        fi
+    fi
+    exit 0
+fi
+
+run_live_row4_download() {
+    local dl_db="$TMP_DIFF/row4-live.sqlite"
+    local dl_file="$TMP_DIFF/live40m.bin"
+    local pre_ib_file="$TMP_DIFF/row4-pre-netstat.txt"
+    local post_ib_file="$TMP_DIFF/row4-post-netstat.txt"
+    local egress_json_file="$TMP_DIFF/row4-egress.json"
+    local rec_err_file="$TMP_DIFF/row4-recorder.stderr"
+    rm -f "$dl_db" "${dl_db}-wal" "${dl_db}-shm" "$dl_file" "$pre_ib_file" "$post_ib_file" "$egress_json_file" "$rec_err_file"
+
+    local expected_bytes="${CHRONOMAC_LIVE_DOWNLOAD_EXPECTED_BYTES:-}"
+    if [[ -z "$expected_bytes" ]]; then
+        if [[ "$CHRONOMAC_LIVE_DOWNLOAD_URL" =~ [?\&]bytes=([0-9]+) ]]; then
+            expected_bytes="${BASH_REMATCH[1]}"
+        else
+            expected_bytes=41943040
+        fi
+    fi
+
+    /usr/sbin/netstat -ibn > "$pre_ib_file"
+    "$WORK_BIN" record --db "$dl_db" --interval 2 --duration 60 --max-db-mb 250 --no-dns >/dev/null 2>"$rec_err_file" &
+    local dl_rec_pid=$!
+    REC_PID="$dl_rec_pid"
+
+    sleep 2
+
+    local dl_t0
+    dl_t0="$(/usr/bin/python3 -c 'import time; print(f"{time.monotonic():.3f}")')"
+    set +e
+    /usr/bin/curl -q -fsSL --limit-rate 3M --max-time 45 -o "$dl_file" "$CHRONOMAC_LIVE_DOWNLOAD_URL"
+    local curl_rc=$?
+    set -e
+    local dl_t1
+    dl_t1="$(/usr/bin/python3 -c 'import time; print(f"{time.monotonic():.3f}")')"
+    local dl_elapsed
+    dl_elapsed="$(/usr/bin/python3 -c "print(f'{max(0.0, float($dl_t1) - float($dl_t0)):.2f}')")"
+
+    if [[ "$curl_rc" -ne 0 ]]; then
+        rm -f "$dl_file"
+        terminate_and_reap "$dl_rec_pid"
+        REC_PID=""
+        echo "FAIL [Row 4]: curl live download failed with exit code $curl_rc (not skipped)!" >&2
+        exit 1
+    fi
+
+    if [[ ! -f "$dl_file" ]]; then
+        terminate_and_reap "$dl_rec_pid"
+        REC_PID=""
+        echo "FAIL [Row 4]: curl exited 0 but downloaded file is missing!" >&2
+        exit 1
+    fi
+
+    local actual_bytes
+    actual_bytes="$(wc -c < "$dl_file" | tr -d '[:space:]')"
+    rm -f "$dl_file"
+
+    # Let at least one full 2s sampling interval complete after curl closes its socket, then stop right after a tick commits
+    sleep 2.2
+    /usr/bin/python3 - "$dl_db" "$dl_rec_pid" <<'PY'
+import os, sqlite3, sys, time
+db_path, pid = sys.argv[1], int(sys.argv[2])
+def tick_count():
+    if not os.path.exists(db_path):
+        return 0
+    try:
+        c = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        n = c.execute("SELECT COUNT(*) FROM system_ticks;").fetchone()[0]
+        c.close()
+        return int(n)
+    except Exception:
+        return 0
+base_n = tick_count()
+deadline = time.monotonic() + 3.0
+while time.monotonic() < deadline:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        break
+    if tick_count() > base_n:
+        break
+    time.sleep(0.02)
+PY
+    /usr/sbin/netstat -ibn > "$post_ib_file"
+    if kill -0 "$dl_rec_pid" 2>/dev/null; then
+        kill -TERM "$dl_rec_pid" 2>/dev/null || true
+    fi
+    set +e
+    wait "$dl_rec_pid"
+    local rec_rc=$?
+    set -e
+    REC_PID=""
+    if [[ "$rec_rc" -ne 0 ]]; then
+        echo "FAIL [Row 4]: ChronoMac record exited with code $rec_rc: $(cat "$rec_err_file" 2>/dev/null)" >&2
+        exit 1
+    fi
+
+    "$WORK_BIN" --cli egress --db "$dl_db" --lang en --json > "$egress_json_file"
+    evaluate_row4_live_download "$egress_json_file" "$pre_ib_file" "$post_ib_file" "$actual_bytes" "$expected_bytes" "$dl_elapsed"
+
+    if pgrep -f "$WORK_BIN" >/dev/null 2>&1; then
+        echo "FAIL [Row 4]: Lingering ChronoMac process found after Row 4 live download check!" >&2
+        exit 1
+    fi
+}
+
+if [[ "$LIVE_ROW4_ONLY" -eq 1 ]]; then
+    if [[ -z "${CHRONOMAC_LIVE_DOWNLOAD_URL:-}" ]]; then
+        echo "FAIL [Row 4]: --row4-live-only requires CHRONOMAC_LIVE_DOWNLOAD_URL to be set!" >&2
+        exit 2
+    fi
+    echo "========================================================================"
+    echo "ChronoMac M1 Row 4 Live 40 MB External NIC Download Verification"
+    echo "========================================================================"
+    echo "Load Start: $(/usr/bin/uptime | sed 's/^[[:space:]]*//')"
+    run_live_row4_download
+    if [[ -n "$BEFORE_REAL_DB_SHA" ]]; then
+        AFTER_REAL_DB_SHA="$(shasum -a 256 "$REAL_USER_DB" | awk '{print $1}')"
+        if [[ "$BEFORE_REAL_DB_SHA" != "$AFTER_REAL_DB_SHA" ]]; then
+            echo "CRITICAL FAIL: Host $REAL_USER_DB SHA-256 changed!" >&2
+            exit 1
+        fi
+    fi
+    if [[ -n "$BEFORE_REAL_PLIST_SHA" ]]; then
+        AFTER_REAL_PLIST_SHA="$(shasum -a 256 "$REAL_USER_PLIST" | awk '{print $1}')"
+        if [[ "$BEFORE_REAL_PLIST_SHA" != "$AFTER_REAL_PLIST_SHA" ]]; then
+            echo "CRITICAL FAIL: Host $REAL_USER_PLIST SHA-256 changed!" >&2
+            exit 1
+        fi
+    fi
     if [[ -n "$BEFORE_LA_SNAP" ]]; then
         AFTER_LA_SNAP="$(ls -1A "$REAL_LA_DIR" | shasum -a 256 | awk '{print $1}')"
         if [[ "$BEFORE_LA_SNAP" != "$AFTER_LA_SNAP" ]]; then
@@ -1004,15 +1296,7 @@ PY
     echo "  -> [Synthetic Fixture Unit Test] 40 MB physical NIC calibration: PASS (0.0% error vs netstat -ib, 90.0% on curl, +4 MB in Unattributed/未归属, 0 B smeared onto apsd; negative discrepancy guarded by tr2OverAttributedPerPIDTrafficPreservesNegativeDiscrepancyWithoutClampingToZero)."
     run_offline_60s_nic_calibration
     if [[ -n "${CHRONOMAC_LIVE_DOWNLOAD_URL:-}" ]]; then
-        DL_DB="$TMP_DIFF/row4-live.sqlite"
-        PRE_IB="$(/usr/sbin/netstat -ibn)"
-        "$WORK_BIN" record --db "$DL_DB" --interval 2 --duration 24 --no-dns >/dev/null &
-        DL_REC_PID=$!
-        sleep 2
-        /usr/bin/curl -fsSL --max-time 18 -o "$TMP_DIFF/live40m.bin" "$CHRONOMAC_LIVE_DOWNLOAD_URL"
-        wait "$DL_REC_PID"
-        POST_IB="$(/usr/sbin/netstat -ibn)"
-        echo "  -> [PASS] Row 4: Live external download completed via CHRONOMAC_LIVE_DOWNLOAD_URL."
+        run_live_row4_download
         PASSED=$((PASSED + 1))
     else
         echo "  -> [SKIP] Row 4 (40 MB live external NIC download): 没跑 (blocked by offline no-network acceptance rule; traffic to own LAN IP on macOS traverses lo0 rather than en0; set CHRONOMAC_LIVE_DOWNLOAD_URL to opt in)."

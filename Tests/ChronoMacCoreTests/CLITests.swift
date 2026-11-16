@@ -1060,4 +1060,238 @@ struct CLITests {
         let histJSON = try #require(JSONSerialization.jsonObject(with: Data(histRes.stdout.utf8)) as? [String: Any])
         #expect((histJSON["recordedGapCount"] as? Int) == 1)
     }
+
+    @Test("Row 4: m1-differential.sh live download evaluator enforces <=10% physical en* NIC diff, >=80% curl share, file size check, and fails on curl error")
+    func row4LiveDownloadEvaluatorEnforcesTenPercentNICAndEightyPercentCurlBounds() throws {
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let diffScriptURL = repoRoot.appendingPathComponent("Scripts/acceptance/m1-differential.sh")
+        let diffScript = try String(contentsOf: diffScriptURL, encoding: .utf8)
+
+        // Script must rate-limit curl (`--limit-rate 3M`), disclose why, query `--cli egress --json`, and keep unset URL as `[SKIP] ... 没跑`
+        #expect(diffScript.contains("--limit-rate 3M"))
+        #expect(diffScript.contains("--cli egress"))
+        #expect(diffScript.contains("--json"))
+        #expect(diffScript.contains("[SKIP] Row 4 (40 MB live external NIC download): 没跑"))
+
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("chronomac-row4-eval-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        // Synthetic netstat -ibn pre/post:
+        // - en0 has NO Address column (10 tokens; +5,000,000 B inbound)
+        // - en1 has MAC Address column (11 tokens; +40,000,000 B inbound) plus IPv4/IPv6 alias rows that must not be double-counted
+        // - lo0 (+200,000,000 B), utun0 (+150,000,000 B), bridge0 (+90,000,000 B), awdl0 (+30,000,000 B) must ALL be excluded!
+        // Exact physical en* inbound delta = 45,000,000 B.
+        let preIB = """
+        Name       Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes  Coll
+        lo0        16384 <Link#1>                          1000     0   50000000     1000     0   50000000     0
+        lo0        16384 127           127.0.0.1           1000     -   50000000     1000     -   50000000     -
+        en0        1500  <Link#7>                           500     0   10000000      400     0    2000000     0
+        en1        1500  <Link#15>   6a:01:72:bb:b5:a7    20000     0  100000000    15000     0   30000000     0
+        en1        1500  192.168.1/24  192.168.1.20       20000     -  100000000    15000     -   30000000     -
+        bridge0    1500  <Link#16>   36:4b:81:20:0a:00       10     0       5000       10     0       5000     0
+        awdl0      1500  <Link#17>   da:dc:14:2f:8b:3d      100     0     100000      100     0     100000     0
+        utun0      1500  <Link#19>                           20     0      10000       20     0      10000     0
+        """
+        let postIB = """
+        Name       Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes  Coll
+        lo0        16384 <Link#1>                          9000     0  250000000     9000     0  250000000     0
+        lo0        16384 127           127.0.0.1           9000     -  250000000     9000     -  250000000     -
+        en0        1500  <Link#7>                          4500     0   15000000      800     0    2200000     0
+        en1        1500  <Link#15>   6a:01:72:bb:b5:a7    52000     0  140000000    18000     0   31000000     0
+        en1        1500  192.168.1/24  192.168.1.20       52000     -  140000000    18000     -   31000000     -
+        bridge0    1500  <Link#16>   36:4b:81:20:0a:00     8010     0   90005000     8010     0   90005000     0
+        awdl0      1500  <Link#17>   da:dc:14:2f:8b:3d     2100     0   30100000     2100     0   30100000     0
+        utun0      1500  <Link#19>                         9020     0  150010000     9020     0  150010000     0
+        """
+
+        let preURL = tmpDir.appendingPathComponent("pre_ib.txt")
+        let postURL = tmpDir.appendingPathComponent("post_ib.txt")
+        try preIB.write(to: preURL, atomically: true, encoding: .utf8)
+        try postIB.write(to: postURL, atomically: true, encoding: .utf8)
+
+        let fileSize = 41_943_040
+
+        func runEvaluator(
+            flows: [[String: Any]],
+            actualBytes: Int = fileSize,
+            expectedBytes: Int = fileSize
+        ) throws -> (exitCode: Int32, stdout: String, stderr: String) {
+            let egressURL = tmpDir.appendingPathComponent("egress-\(UUID().uuidString).json")
+            let payload: [String: Any] = [
+                "windowHours": 1,
+                "loopbackExcluded": true,
+                "flows": flows
+            ]
+            let jsonData = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+            try jsonData.write(to: egressURL, options: .atomic)
+
+            let proc = Process()
+            proc.currentDirectoryURL = repoRoot
+            proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+            proc.arguments = [
+                diffScriptURL.path,
+                "--verify-row4-fixtures",
+                egressURL.path,
+                preURL.path,
+                postURL.path,
+                "\(actualBytes)",
+                "\(expectedBytes)",
+                "13.30"
+            ]
+            let outPipe = Pipe()
+            let errPipe = Pipe()
+            proc.standardOutput = outPipe
+            proc.standardError = errPipe
+            try proc.run()
+            let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            return (
+                proc.terminationStatus,
+                String(data: outData, encoding: .utf8) ?? "",
+                String(data: errData, encoding: .utf8) ?? ""
+            )
+        }
+
+        // 1. Total inbound differs by -15% (38,250,000 vs 45,000,000) while curl is 91.2% of file -> MUST FAIL!
+        let diffMinus15 = try runEvaluator(flows: [
+            [
+                "processName": "curl",
+                "execPath": "/usr/bin/curl",
+                "isUnattributed": false,
+                "remoteEndpoint": "104.18.3.2:443",
+                "protocol": "tcp4",
+                "totalBytesIn": 38_250_000,
+                "totalBytesOut": 120_000
+            ]
+        ])
+        #expect(diffMinus15.exitCode != 0, "Expected 15% negative total inbound discrepancy to fail; stdout=\(diffMinus15.stdout)")
+        #expect(diffMinus15.stderr.contains("FAIL [Row 4]"))
+
+        // 1b. Total inbound differs by +15% (51,750,000 vs 45,000,000) -> MUST FAIL!
+        let diffPlus15 = try runEvaluator(flows: [
+            [
+                "processName": "curl",
+                "execPath": "/usr/bin/curl",
+                "isUnattributed": false,
+                "remoteEndpoint": "104.18.3.2:443",
+                "protocol": "tcp4",
+                "totalBytesIn": 40_000_000,
+                "totalBytesOut": 120_000
+            ],
+            [
+                "processName": "Unattributed",
+                "execPath": "",
+                "isUnattributed": true,
+                "remoteEndpoint": "(physical NIC residual)",
+                "protocol": "nic",
+                "totalBytesIn": 11_750_000,
+                "totalBytesOut": 10_000
+            ]
+        ])
+        #expect(diffPlus15.exitCode != 0, "Expected 15% positive total inbound discrepancy to fail; stdout=\(diffPlus15.stdout)")
+        #expect(diffPlus15.stderr.contains("FAIL [Row 4]"))
+
+        // 2. curl attributed inbound is 60% of file size (25,165,824 B) while total matches netstat 0.0% -> MUST FAIL!
+        let curl60Bytes = Int(Double(fileSize) * 0.60)
+        let curl60 = try runEvaluator(flows: [
+            [
+                "processName": "curl",
+                "execPath": "/usr/bin/curl",
+                "isUnattributed": false,
+                "remoteEndpoint": "104.18.3.2:443",
+                "protocol": "tcp4",
+                "totalBytesIn": curl60Bytes,
+                "totalBytesOut": 120_000
+            ],
+            [
+                "processName": "Unattributed",
+                "execPath": "",
+                "isUnattributed": true,
+                "remoteEndpoint": "(physical NIC residual)",
+                "protocol": "nic",
+                "totalBytesIn": 45_000_000 - curl60Bytes,
+                "totalBytesOut": 10_000
+            ]
+        ])
+        #expect(curl60.exitCode != 0, "Expected 60% curl attribution (<80% floor) to fail; stdout=\(curl60.stdout)")
+        #expect(curl60.stderr.contains("FAIL [Row 4]"))
+
+        // 3. Downloaded file size mismatch -> MUST FAIL (not skip)!
+        let badSize = try runEvaluator(
+            flows: [
+                [
+                    "processName": "curl",
+                    "execPath": "/usr/bin/curl",
+                    "isUnattributed": false,
+                    "remoteEndpoint": "104.18.3.2:443",
+                    "protocol": "tcp4",
+                    "totalBytesIn": 41_454_545,
+                    "totalBytesOut": 120_000
+                ]
+            ],
+            actualBytes: 12_345_678,
+            expectedBytes: fileSize
+        )
+        #expect(badSize.exitCode != 0, "Expected wrong downloaded file size to fail")
+        #expect(badSize.stderr.contains("FAIL [Row 4]"))
+
+        // 4. Both within thresholds (total diff -0.01%, curl 98.84% of file, lo0/utun0/bridge0 ignored, 10-col + 11-col en* parsed) -> MUST PASS!
+        let valid = try runEvaluator(flows: [
+            [
+                "processName": "curl",
+                "execPath": "/usr/bin/curl",
+                "isUnattributed": false,
+                "remoteEndpoint": "104.18.3.2:443",
+                "protocol": "tcp4",
+                "totalBytesIn": 41_454_545,
+                "totalBytesOut": 120_000
+            ],
+            [
+                "processName": "Unattributed",
+                "execPath": "",
+                "isUnattributed": true,
+                "remoteEndpoint": "(physical NIC residual)",
+                "protocol": "nic",
+                "totalBytesIn": 3_540_000,
+                "totalBytesOut": 10_000
+            ]
+        ])
+        #expect(valid.exitCode == 0, "Expected valid fixture to pass; stderr=\(valid.stderr)")
+        #expect(valid.stdout.contains("[PASS] Row 4"))
+        #expect(valid.stdout.contains("45000000"))
+        #expect(valid.stdout.contains("44994545"))
+        #expect(valid.stdout.contains("41454545"))
+
+        // 5. Offline curl failure via nonexistent local file:// URL MUST fail (exit != 0) rather than skip or pass!
+        let failProc = Process()
+        failProc.currentDirectoryURL = repoRoot
+        failProc.executableURL = URL(fileURLWithPath: "/bin/bash")
+        failProc.arguments = [
+            diffScriptURL.path,
+            "--skip-build",
+            "--row4-live-only",
+            "--tmp-root",
+            tmpDir.path
+        ]
+        var failEnv = ProcessInfo.processInfo.environment
+        failEnv["CHRONOMAC_LIVE_DOWNLOAD_URL"] = "file:///nonexistent-chronomac-row4-\(UUID().uuidString)"
+        failProc.environment = failEnv
+        let failOutPipe = Pipe()
+        let failErrPipe = Pipe()
+        failProc.standardOutput = failOutPipe
+        failProc.standardError = failErrPipe
+        try failProc.run()
+        let failOut = String(data: failOutPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let failErr = String(data: failErrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        failProc.waitUntilExit()
+        #expect(failProc.terminationStatus != 0, "Download failure must exit non-zero instead of skipping or passing!")
+        #expect(!failOut.contains("[SKIP]"))
+        #expect(!failOut.contains("[PASS] Row 4"))
+        #expect(failErr.contains("FAIL [Row 4]"))
+    }
 }
