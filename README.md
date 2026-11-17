@@ -46,7 +46,7 @@ See [docs/SPEC.md](docs/SPEC.md) for architecture, schema, and measurement speci
 
 ---
 
-## Install (`v0.3.0`)
+## Install (`v0.4.0`)
 
 ### Homebrew Cask (macOS 14.0+, Apple Silicon)
 
@@ -57,7 +57,7 @@ brew install --cask zxu756/tap/chronomac
 
 ### Direct Release Archive
 
-Download `ChronoMac-v0.3.0-macos-arm64.zip` from Releases, move `ChronoMac.app` to `/Applications`, and clear quarantine if needed:
+Download `ChronoMac-v0.4.0-macos-arm64.zip` from Releases, move `ChronoMac.app` to `/Applications`, and clear quarantine if needed:
 
 ```bash
 xattr -cr /Applications/ChronoMac.app

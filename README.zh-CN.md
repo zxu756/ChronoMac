@@ -46,7 +46,7 @@
 
 ---
 
-## 安装指南 (`v0.3.0`)
+## 安装指南 (`v0.4.0`)
 
 ### Homebrew Cask（macOS 14.0+，Apple Silicon）
 
@@ -57,7 +57,7 @@ brew install --cask zxu756/tap/chronomac
 
 ### 下载发行压缩包
 
-从 Releases 下载 `ChronoMac-v0.3.0-macos-arm64.zip`，将 `ChronoMac.app` 拖入 `/Applications`，首次打开如遇隔离提示可执行：
+从 Releases 下载 `ChronoMac-v0.4.0-macos-arm64.zip`，将 `ChronoMac.app` 拖入 `/Applications`，首次打开如遇隔离提示可执行：
 
 ```bash
 xattr -cr /Applications/ChronoMac.app
