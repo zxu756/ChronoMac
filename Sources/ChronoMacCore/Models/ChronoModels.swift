@@ -190,6 +190,57 @@ public struct ProcessSample: Identifiable, Codable, Equatable, Sendable {
 
     public var id: String { "\(ts)-\(pid)-\(name)" }
 
+    public var isUnattributed: Bool {
+        pid == NettopDeltaParser.unattributedPID || name == NettopDeltaParser.unattributedProcessToken
+    }
+
+    public var hasNegativeNICDiscrepancy: Bool {
+        isUnattributed && (netInBps < 0 || netOutBps < 0)
+    }
+
+    public static func unattributedSample(ts: Int64, netInBps: Int64, netOutBps: Int64) -> ProcessSample {
+        ProcessSample(
+            ts: ts,
+            pid: NettopDeltaParser.unattributedPID,
+            ppid: 0,
+            name: NettopDeltaParser.unattributedProcessToken,
+            execPath: "",
+            bundleID: nil,
+            signingTeam: nil,
+            cpuPct: 0,
+            rssBytes: 0,
+            diskReadBps: 0,
+            diskWriteBps: 0,
+            netInBps: netInBps,
+            netOutBps: netOutBps,
+            isAliveNow: true,
+            isCPUReadable: true
+        )
+    }
+
+    public func localizedName(in language: AppLanguage) -> String {
+        if hasNegativeNICDiscrepancy {
+            return language == .zhHans ? "对不上的量" : "Unmatched delta"
+        }
+        if isUnattributed {
+            return language == .zhHans ? "未归属" : "Unattributed"
+        }
+        return name
+    }
+
+    public func formattedNetworkRate(outboundOnlyForProcesses: Bool) -> String {
+        if !isUnattributed {
+            return ChronoFormatter.rate(outboundOnlyForProcesses ? netOutBps : (netInBps + netOutBps))
+        }
+        if hasNegativeNICDiscrepancy {
+            if netInBps != 0 && netOutBps != 0 {
+                return "↓\(ChronoFormatter.rate(netInBps)) ↑\(ChronoFormatter.rate(netOutBps))"
+            }
+            return ChronoFormatter.rate(netInBps != 0 ? netInBps : netOutBps)
+        }
+        return ChronoFormatter.rate(netOutBps + netInBps)
+    }
+
     public var memoryFootprintBytes: Int64 {
         get { rssBytes }
         set { rssBytes = max(0, newValue) }
@@ -223,13 +274,17 @@ public struct ProcessSample: Identifiable, Codable, Equatable, Sendable {
         self.rssBytes = max(0, rssBytes)
         self.diskReadBps = max(0, diskReadBps)
         self.diskWriteBps = max(0, diskWriteBps)
-        self.netInBps = max(0, netInBps)
-        self.netOutBps = max(0, netOutBps)
+        let allowSignedNet = (pid == NettopDeltaParser.unattributedPID || name == NettopDeltaParser.unattributedProcessToken)
+        self.netInBps = allowSignedNet ? netInBps : max(0, netInBps)
+        self.netOutBps = allowSignedNet ? netOutBps : max(0, netOutBps)
         self.isAliveNow = isAliveNow
         self.isCPUReadable = isCPUReadable
     }
 
     public func formattedCPU(in language: AppLanguage) -> String {
+        if isUnattributed {
+            return "—"
+        }
         guard isCPUReadable else {
             return language == .zhHans ? "无权限" : "No permission"
         }
@@ -237,6 +292,12 @@ public struct ProcessSample: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func livenessLabel(in language: AppLanguage) -> String {
+        if hasNegativeNICDiscrepancy {
+            return language == .zhHans ? "对不上的量" : "Over-attributed"
+        }
+        if isUnattributed {
+            return language == .zhHans ? "网卡差额" : "NIC residual"
+        }
         if isAliveNow {
             return language == .zhHans ? "仍在运行" : "still running"
         } else {
@@ -259,6 +320,34 @@ public struct SocketFlowRecord: Identifiable, Codable, Equatable, Sendable {
 
     public var id: String { "\(bucketHour)::\(execPath)::\(processName)::\(remoteEndpoint)" }
 
+    public var isUnattributed: Bool {
+        remoteEndpoint == NettopDeltaParser.unattributedEndpoint || processName == NettopDeltaParser.unattributedProcessToken
+    }
+
+    public var hasNegativeNICDiscrepancy: Bool {
+        isUnattributed && (totalBytesIn < 0 || totalBytesOut < 0)
+    }
+
+    public func localizedProcessName(in language: AppLanguage) -> String {
+        if hasNegativeNICDiscrepancy {
+            return language == .zhHans ? "对不上的量" : "Unmatched delta"
+        }
+        if isUnattributed {
+            return language == .zhHans ? "未归属" : "Unattributed"
+        }
+        return processName
+    }
+
+    public func localizedEndpoint(in language: AppLanguage) -> String {
+        if hasNegativeNICDiscrepancy {
+            return language == .zhHans ? "（对不上的量：逐进程之和超物理网卡）" : "(unmatched delta: per-PID sum > physical NIC)"
+        }
+        if isUnattributed {
+            return language == .zhHans ? "（物理网卡未归属差额）" : "(physical NIC residual)"
+        }
+        return hostname ?? remoteEndpoint
+    }
+
     public init(
         bucketHour: Int64,
         execPath: String,
@@ -277,8 +366,9 @@ public struct SocketFlowRecord: Identifiable, Codable, Equatable, Sendable {
         self.remoteEndpoint = remoteEndpoint
         self.hostname = hostname
         self.protocolName = protocolName
-        self.totalBytesIn = max(0, totalBytesIn)
-        self.totalBytesOut = max(0, totalBytesOut)
+        let allowSignedBytes = (remoteEndpoint == NettopDeltaParser.unattributedEndpoint || processName == NettopDeltaParser.unattributedProcessToken)
+        self.totalBytesIn = allowSignedBytes ? totalBytesIn : max(0, totalBytesIn)
+        self.totalBytesOut = allowSignedBytes ? totalBytesOut : max(0, totalBytesOut)
         self.firstSeen = firstSeen
         self.lastSeen = lastSeen
     }
@@ -349,6 +439,18 @@ public struct AnomalyBookmark: Identifiable, Codable, Equatable, Sendable {
     }
 }
 
+public struct SamplingGapRecord: Identifiable, Codable, Equatable, Sendable {
+    public var ts: Int64
+    public var reason: String
+
+    public var id: Int64 { ts }
+
+    public init(ts: Int64, reason: String) {
+        self.ts = ts
+        self.reason = reason
+    }
+}
+
 public struct AgentBurstWindow: Identifiable, Codable, Equatable, Sendable {
     public var id: String
     public var vendor: String
@@ -367,30 +469,40 @@ public struct AgentBurstWindow: Identifiable, Codable, Equatable, Sendable {
 
 public enum ChronoFormatter {
     public static func bytes(_ value: Int64) -> String {
-        if value <= 0 { return "0 MB" }
-        let kb = Double(value) / 1024.0
+        if value == 0 { return "0 MB" }
+        let sign = value < 0 ? "-" : ""
+        let mag = value == Int64.min ? UInt64(Int64.max) + 1 : UInt64(abs(value))
+        if mag < 1024 {
+            return "\(sign)\(mag) B"
+        }
+        let kb = Double(mag) / 1024.0
         if kb < 1024.0 {
-            return String(format: "%.0f KB", kb)
+            return sign + String(format: "%.0f KB", kb)
         }
         let mb = kb / 1024.0
         if mb < 1024.0 {
-            return mb >= 100 ? String(format: "%.0f MB", mb) : String(format: "%.1f MB", mb)
+            return sign + (mb >= 100 ? String(format: "%.0f MB", mb) : String(format: "%.1f MB", mb))
         }
         let gb = mb / 1024.0
-        return String(format: "%.2f GB", gb)
+        return sign + String(format: "%.2f GB", gb)
     }
 
     public static func rate(_ bytesPerSec: Int64) -> String {
-        if bytesPerSec <= 0 { return "0 KB/s" }
-        let kb = Double(bytesPerSec) / 1024.0
+        if bytesPerSec == 0 { return "0 KB/s" }
+        let sign = bytesPerSec < 0 ? "-" : ""
+        let mag = bytesPerSec == Int64.min ? UInt64(Int64.max) + 1 : UInt64(abs(bytesPerSec))
+        if mag < 1024 {
+            return "\(sign)\(mag) B/s"
+        }
+        let kb = Double(mag) / 1024.0
         if kb < 1024.0 {
-            return kb >= 10 ? String(format: "%.0f KB/s", kb) : String(format: "%.1f KB/s", kb)
+            return sign + (kb >= 10 ? String(format: "%.0f KB/s", kb) : String(format: "%.1f KB/s", kb))
         }
         let mb = kb / 1024.0
         if mb < 1024.0 {
-            return mb >= 100 ? String(format: "%.0f MB/s", mb) : String(format: "%.1f MB/s", mb)
+            return sign + (mb >= 100 ? String(format: "%.0f MB/s", mb) : String(format: "%.1f MB/s", mb))
         }
-        return String(format: "%.2f GB/s", mb / 1024.0)
+        return sign + String(format: "%.2f GB/s", mb / 1024.0)
     }
 
     public static func clockTime(_ ts: Int64, timeZone: TimeZone = .current) -> String {

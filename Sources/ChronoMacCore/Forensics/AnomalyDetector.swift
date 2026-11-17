@@ -94,8 +94,8 @@ public final class AnomalyDetector: @unchecked Sendable {
             )
         }
 
-        // 5. High-volume new external endpoint (>= 5 MB transfer on unseen external host; loopback never allowed)
-        let externalSockets = sockets.filter { !NettopDeltaParser.isLoopbackOrLinkLocal($0.remoteEndpoint) }
+        // 5. High-volume new external endpoint (>= 5 MB transfer on unseen external host; loopback and NIC residual never allowed)
+        let externalSockets = sockets.filter { !$0.isUnattributed && !NettopDeltaParser.isLoopbackOrLinkLocal($0.remoteEndpoint) }
         let isInitialSeed = seenEndpoints.isEmpty
         for s in externalSockets {
             let ownerIdentity = s.execPath.isEmpty ? s.processName : s.execPath

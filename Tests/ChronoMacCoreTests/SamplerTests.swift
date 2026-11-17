@@ -430,6 +430,245 @@ struct SamplerTests {
         #expect(kRes.loopbackRxBytesPerSec == 0)
     }
 
+    @Test("T20: Recorded real 2-tick nettop loopback fixture file parses non-zero per-PID loopback delta with zero external inflation")
+    func t20RecordedTwoTickNettopLoopbackFixture() throws {
+        let fixtureURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/recorded_nettop_loopback_2tick_2026-11-15.txt")
+        let rawText = try String(contentsOf: fixtureURL, encoding: .utf8)
+        #expect(rawText.contains("2026-11-15"))
+        #expect(!rawText.lowercased().contains("synthetic fixture"))
+
+        let nonCommentLines = rawText
+            .components(separatedBy: .newlines)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("#") }
+            .joined(separator: "\n")
+        let sections = nonCommentLines.components(separatedBy: "=== TICK 2 ===")
+        #expect(sections.count == 2)
+        let tick1 = sections[0].replacingOccurrences(of: "=== TICK 1 ===", with: "")
+        let tick2 = sections[1]
+
+        let parser = NettopDeltaParser()
+        let r1 = parser.ingestCSV(tick1, now: 10_000.0)
+        #expect(r1.totalInBps == 0)
+        #expect(r1.loopbackRxBytesPerSec == 0)
+
+        // Tick 1 -> Tick 2 transferred 655,360 bytes (2,048 -> 657,408) over dt = 2.0s -> 327,680 B/s on PID 9122
+        let r2 = parser.ingestCSV(tick2, now: 10_002.0)
+        #expect(r2.totalInBps == 0)
+        #expect(r2.totalOutBps == 0)
+        #expect(r2.externalSocketDeltas.isEmpty)
+        #expect(r2.loopbackRxBytesPerSec == 327_680)
+        #expect(r2.loopbackTxBytesPerSec == 327_680)
+        #expect(r2.perPIDLoopbackInBps[9122] == 327_680)
+        #expect(r2.perPIDLoopbackOutBps[9122] == 327_680)
+    }
+
+    @Test("T7 (M1): /bin/ps time parser and non-root sampler read WindowServer (UID 88) and launchd (UID 0) CPU without sudo while kernel_task (PID 0) stays No permission")
+    func t7NonRootReadsWindowServerAndRootCPUWhileKernelTaskStaysUnreadable() throws {
+        // 1. Unit-verify cumulative ps CPU time formats: MM:SS.ss, HHH:MM.ss, DD-HH:MM:SS.ss
+        let centi5Ns: UInt64 = 50_000_000
+        let min12Sec34Ns: UInt64 = UInt64(12 * 60 + 34) * 1_000_000_000 + 560_000_000
+        let min2026Ns: UInt64 = UInt64(2026 * 60 + 27) * 1_000_000_000 + 280_000_000
+        let twoDaysSec: UInt64 = 2 * 86_400 + 3 * 3_600 + 4 * 60 + 5
+        let twoDaysNs: UInt64 = twoDaysSec * 1_000_000_000 + 250_000_000
+        #expect(ProcessTreeSampler.parsePsTimeToNanoseconds("0:00.05") == centi5Ns)
+        #expect(ProcessTreeSampler.parsePsTimeToNanoseconds("12:34.56") == min12Sec34Ns)
+        #expect(ProcessTreeSampler.parsePsTimeToNanoseconds("2026:27.28") == min2026Ns)
+        #expect(ProcessTreeSampler.parsePsTimeToNanoseconds("2-03:04:05.25") == twoDaysNs)
+
+        let syntheticPs = """
+            1   0.4  24576   14:20.10
+          168  42.5  65536 2026:27.28
+        """
+        let parsedMap = ProcessTreeSampler.parsePsSnapshot(syntheticPs)
+        #expect(parsedMap[1]?.rssBytes == Int64(25_165_824))
+        #expect(parsedMap[168]?.instantCPUPct == 42.5)
+        #expect(parsedMap[168]?.rssBytes == Int64(67_108_864))
+
+        // 2. Live non-root verification on this Mac (zero sudo): launchd (PID 1) and WindowServer (if running) are readable,
+        //    whereas kernel_task (PID 0) genuinely remains unreadable (isCPUReadable == false -> "No permission" / "无权限").
+        #expect(geteuid() != 0)
+        let sampler = ProcessTreeSampler()
+        _ = sampler.sampleTopProcesses(ts: 2_000, netInBpsByPID: [:], netOutBpsByPID: [:], limit: 300)
+        Thread.sleep(forTimeInterval: 0.30)
+        let (procs, _, _, _) = sampler.sampleTopProcesses(ts: 2_001, netInBpsByPID: [:], netOutBpsByPID: [:], limit: 300)
+
+        let launchdProc = try #require(procs.first(where: { $0.pid == 1 }))
+        #expect(launchdProc.isCPUReadable == true)
+        #expect(launchdProc.memoryFootprintBytes > 0)
+
+        if let windowServer = procs.first(where: { $0.name == "WindowServer" }) {
+            #expect(windowServer.isCPUReadable == true)
+            #expect(windowServer.memoryFootprintBytes > 0)
+            #expect(windowServer.formattedCPU(in: .en) != "No permission")
+            #expect(windowServer.formattedCPU(in: .zhHans) != "无权限")
+        }
+
+        let kernelTask = try #require(procs.first(where: { $0.pid == 0 }))
+        #expect(kernelTask.name == "kernel_task")
+        #expect(kernelTask.isCPUReadable == false)
+        #expect(kernelTask.formattedCPU(in: .en) == "No permission")
+        #expect(kernelTask.formattedCPU(in: .zhHans) == "无权限")
+    }
+
+    @Test("M1 Item 2: Live 64-bit PhysicalNICCounterReader matches /usr/sbin/netstat -ib physical external interfaces and excludes lo0/utun/bridge")
+    func m1LivePhysicalNICCounterMatchesNetstatIB() throws {
+        let netstatProc = Process()
+        netstatProc.executableURL = URL(fileURLWithPath: "/usr/sbin/netstat")
+        netstatProc.arguments = ["-ib"]
+        let pipe = Pipe()
+        netstatProc.standardOutput = pipe
+        try netstatProc.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        netstatProc.waitUntilExit()
+        let netstatText = try #require(String(data: data, encoding: .utf8))
+
+        let parsedNetstat = PhysicalNICCounterReader.parseNetstatIB(netstatText)
+        let liveSysctl = PhysicalNICCounterReader.readLiveCounters()
+
+        #expect(liveSysctl.interfaces["lo0"]?.isLoopback == true)
+        #expect(liveSysctl.interfaces["lo0"]?.isPhysicalExternal == false)
+
+        // Every active en* physical interface must match netstat -ib within small live traffic tolerance (< 5 MiB)
+        for (ifName, nsEntry) in parsedNetstat.interfaces where nsEntry.isPhysicalExternal {
+            guard let sysEntry = liveSysctl.interfaces[ifName] else {
+                Issue.record("Missing interface \(ifName) in sysctl NET_RT_IFLIST2 snapshot")
+                continue
+            }
+            #expect(sysEntry.isPhysicalExternal == true)
+            let diffIn = sysEntry.bytesIn >= nsEntry.bytesIn ? sysEntry.bytesIn - nsEntry.bytesIn : nsEntry.bytesIn - sysEntry.bytesIn
+            let diffOut = sysEntry.bytesOut >= nsEntry.bytesOut ? sysEntry.bytesOut - nsEntry.bytesOut : nsEntry.bytesOut - sysEntry.bytesOut
+            #expect(diffIn < 5 * 1024 * 1024)
+            #expect(diffOut < 5 * 1024 * 1024)
+        }
+    }
+
+    @Test("M1 Item 2: Physical NIC calibration on 200 MB loopback + 40 MB en1 download attributes >=80% to curl, puts 4 MB residual in Unattributed/未归属, and smears 0 bytes onto apsd")
+    @MainActor
+    func m1PhysicalNICCalibrationFortyMBAndLoopbackIsolation() throws {
+        let fixtureURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/synthetic_nic_40mb_calibration.txt")
+        let raw = try String(contentsOf: fixtureURL, encoding: .utf8)
+        #expect(raw.contains("SYNTHETIC FIXTURE"))
+
+        let clean = raw
+            .components(separatedBy: .newlines)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("#") }
+            .joined(separator: "\n")
+
+        let s1 = clean.components(separatedBy: "=== NETSTAT TICK 2 ===")
+        #expect(s1.count == 2)
+        let netstatTick1 = s1[0].replacingOccurrences(of: "=== NETSTAT TICK 1 ===", with: "")
+        let s2 = s1[1].components(separatedBy: "=== NETTOP TICK 1 ===")
+        #expect(s2.count == 2)
+        let netstatTick2 = s2[0]
+        let s3 = s2[1].components(separatedBy: "=== NETTOP TICK 2 ===")
+        #expect(s3.count == 2)
+        let nettopTick1 = s3[0]
+        let nettopTick2 = s3[1]
+
+        let nic1 = PhysicalNICCounterReader.parseNetstatIB(netstatTick1)
+        let nic2 = PhysicalNICCounterReader.parseNetstatIB(netstatTick2)
+
+        // Verify physical NIC delta vs netstat -ib: +40,000,000 B in, +80,000 B out; lo0 (+200 MiB) and utun0 (+10 MB) excluded!
+        #expect(nic2.externalBytesIn - nic1.externalBytesIn == 40_000_000)
+        #expect(nic2.externalBytesOut - nic1.externalBytesOut == 80_000)
+        #expect(nic2.loopbackBytesIn - nic1.loopbackBytesIn == 209_715_200)
+
+        // 1. Pure 200 MB loopback scenario (physical NIC external counters unchanged: nic1 -> nic1)
+        let loopOnlyParser = NettopDeltaParser()
+        _ = loopOnlyParser.ingestCSV(nettopTick1, now: 20_000.0, nicCounters: nic1)
+        let loopOnlyTick2 = """
+        ,interface,state,bytes_in,bytes_out,
+        apsd.140,,,12000,8000,
+        tcp4 192.168.1.25:50000<->17.57.145.41:5223,en1,Established,12000,8000,
+        local-loop.8080,,,209716200,209716200,
+        tcp4 127.0.0.1:51000<->127.0.0.1:8080,lo0,Established,209716200,209716200,
+        """
+        let loopRes = loopOnlyParser.ingestCSV(loopOnlyTick2, now: 20_002.0, nicCounters: nic1)
+        #expect(loopRes.totalInBps == 0)
+        #expect(loopRes.totalOutBps == 0)
+        #expect(loopRes.unattributedInBytes == 0)
+        #expect(loopRes.unattributedOutBytes == 0)
+        #expect(loopRes.loopbackRxBytesPerSec == 104_857_600)
+
+        // 2. 40 MB physical NIC download + simultaneous 200 MiB loopback + 10 MB utun0 tunnel (dt = 2.0s)
+        let calParser = NettopDeltaParser()
+        let baseRes = calParser.ingestCSV(nettopTick1, now: 30_000.0, nicCounters: nic1)
+        #expect(baseRes.totalInBps == 0)
+
+        let dlRes = calParser.ingestCSV(nettopTick2, now: 30_002.0, nicCounters: nic2)
+        // Calibrated total inbound: 40,000,000 B / 2.0s = 20,000,000 B/s (0.0% <= 10% error vs netstat -ib!)
+        #expect(dlRes.totalInBps == 20_000_000)
+        #expect(dlRes.totalOutBps == 40_000)
+
+        // curl (PID 999) gets 36,000,000 B / 2.0s = 18,000,000 B/s (90.0% >= 80% of 40 MB!)
+        #expect(dlRes.perPIDBytesInDelta[999] == 18_000_000)
+        #expect(dlRes.perPIDBytesOutDelta[999] == 32_000)
+
+        // Innocent apsd (PID 140) gets strictly 0 bytes (never smeared!)
+        #expect((dlRes.perPIDBytesInDelta[140] ?? 0) == 0)
+        #expect((dlRes.perPIDBytesOutDelta[140] ?? 0) == 0)
+
+        // Remaining 4,000,000 B inbound (2,000,000 B/s) and 16,000 B outbound (8,000 B/s) go to Unattributed / 未归属!
+        #expect(dlRes.unattributedInBytes == 4_000_000)
+        #expect(dlRes.unattributedOutBytes == 16_000)
+        #expect(dlRes.perPIDBytesInDelta[NettopDeltaParser.unattributedPID] == 2_000_000)
+        #expect(dlRes.perPIDBytesOutDelta[NettopDeltaParser.unattributedPID] == 8_000)
+
+        // Verify end-to-end persistence & EN/ZH localization in FlightboxStore + ChronoMonitor
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("chronomac-nic-cal-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        let store = try FlightboxStore(databaseURL: tmpDir.appendingPathComponent("flightbox.sqlite"))
+        let stub = StubSystemSampler()
+        stub.netResult = dlRes
+        stub.procSnapshot = ProcessTreeSnapshot(
+            processes: [
+                ProcessSample(
+                    ts: 30_002, pid: 999, ppid: 1, name: "curl", execPath: "/usr/bin/curl",
+                    cpuPct: 12.0, rssBytes: 18_000_000,
+                    netInBps: dlRes.perPIDBytesInDelta[999] ?? 0,
+                    netOutBps: dlRes.perPIDBytesOutDelta[999] ?? 0
+                ),
+                ProcessSample(
+                    ts: 30_002, pid: 140, ppid: 1, name: "apsd", execPath: "/System/Library/PrivateFrameworks/ApplePushService.framework/apsd",
+                    cpuPct: 0.2, rssBytes: 12_000_000,
+                    netInBps: dlRes.perPIDBytesInDelta[140] ?? 0,
+                    netOutBps: dlRes.perPIDBytesOutDelta[140] ?? 0
+                ),
+                ProcessSample.unattributedSample(
+                    ts: 30_002,
+                    netInBps: dlRes.perPIDBytesInDelta[NettopDeltaParser.unattributedPID] ?? 0,
+                    netOutBps: dlRes.perPIDBytesOutDelta[NettopDeltaParser.unattributedPID] ?? 0
+                )
+            ],
+            totalDiskReadBps: 0,
+            totalDiskWriteBps: 0,
+            livePIDs: [1, 140, 999]
+        )
+        let monitor = ChronoMonitor(store: store, sampler: stub, startSamplingTimer: false)
+        monitor.captureLiveTick(nowOverride: 30_002)
+
+        let (_, storedProcs) = store.queryNearestProcesses(at: 30_002, livePIDs: [1, 140, 999], sortBy: .network)
+        let unattrProc = try #require(storedProcs.first(where: { $0.pid == NettopDeltaParser.unattributedPID }))
+        #expect(unattrProc.localizedName(in: .en) == "Unattributed")
+        #expect(unattrProc.localizedName(in: .zhHans) == "未归属")
+        #expect(unattrProc.netInBps == 2_000_000)
+
+        let storedFlows = store.querySocketFlows(sinceTs: 29_900, limit: 20)
+        let unattrFlow = try #require(storedFlows.first(where: { $0.isUnattributed }))
+        #expect(unattrFlow.localizedProcessName(in: .en) == "Unattributed")
+        #expect(unattrFlow.localizedProcessName(in: .zhHans) == "未归属")
+        #expect(unattrFlow.totalBytesIn == 4_000_000)
+        #expect(unattrFlow.totalBytesOut == 16_000)
+
+        // Synthetic Unattributed residual must NEVER trigger a "New remote host" anomaly!
+        let anomalies = store.queryAnomalies(sinceTs: 29_900, limit: 20)
+        #expect(!anomalies.contains(where: { $0.kind == .newExternalHost && $0.culpritName == NettopDeltaParser.unattributedProcessToken }))
+    }
+
     @Test("T7 & T10: Real ProcessTreeSampler measures non-zero CPU & memory footprint on current process and surfaces EPERM processes as No permission")
     func realProcessTreeSamplerMeasuresCurrentProcessAndSurfacesUnreadableSystemPIDs() {
         let sampler = ProcessTreeSampler()
@@ -699,5 +938,129 @@ struct SamplerTests {
                 || $0.metricBadge.contains("127.0.0.1")
         }
         #expect(loopbackAnomalies.isEmpty)
+    }
+
+    @Test("TR2: When per-PID attributed network bytes exceed physical NIC delta, negative discrepancy is preserved and labeled 对不上的量 instead of clamping to 0")
+    func tr2OverAttributedPerPIDTrafficPreservesNegativeDiscrepancyWithoutClampingToZero() throws {
+        let nic1 = PhysicalNICCounterSnapshot(interfaces: [
+            "en0": PhysicalNICInterfaceCounters(
+                name: "en0",
+                isLoopback: false,
+                isPhysicalExternal: true,
+                bytesIn: 100_000_000,
+                bytesOut: 20_000_000
+            )
+        ])
+        // Over dt = 2.0s: physical NIC gained +30,000,000 B in / +50,000 B out,
+        // while per-PID nettop reported +36,000,000 B in / +80,000 B out on curl.999.
+        let nic2 = PhysicalNICCounterSnapshot(interfaces: [
+            "en0": PhysicalNICInterfaceCounters(
+                name: "en0",
+                isLoopback: false,
+                isPhysicalExternal: true,
+                bytesIn: 130_000_000,
+                bytesOut: 20_050_000
+            )
+        ])
+
+        let tick1CSV = """
+        time,interface,state,bytes_in,bytes_out,
+        curl.999,,,1000000,10000,
+        tcp4 192.168.1.25:51001<->151.101.1.69:443,en0,Established,1000000,10000,
+        """
+        let tick2CSV = """
+        time,interface,state,bytes_in,bytes_out,
+        curl.999,,,37000000,90000,
+        tcp4 192.168.1.25:51001<->151.101.1.69:443,en0,Established,37000000,90000,
+        """
+
+        let parser = NettopDeltaParser()
+        _ = parser.ingestCSV(tick1CSV, now: 40_000.0, nicCounters: nic1)
+        let res = parser.ingestCSV(tick2CSV, now: 40_002.0, nicCounters: nic2)
+
+        #expect(res.totalInBps == 15_000_000)
+        #expect(res.totalOutBps == 25_000)
+        #expect(res.perPIDBytesInDelta[999] == 18_000_000)
+        #expect(res.perPIDBytesOutDelta[999] == 40_000)
+
+        // Negative discrepancy MUST NOT be truncated to 0!
+        #expect(res.unattributedInBytes == -6_000_000)
+        #expect(res.unattributedOutBytes == -30_000)
+        #expect(res.unattributedInBps == -3_000_000)
+        #expect(res.unattributedOutBps == -15_000)
+        #expect(res.perPIDBytesInDelta[NettopDeltaParser.unattributedPID] == -3_000_000)
+        #expect(res.perPIDBytesOutDelta[NettopDeltaParser.unattributedPID] == -15_000)
+
+        // Exact ledger conservation: sum of all per-PID rows (including negative discrepancy) == physical NIC rate
+        let sumInBps = res.perPIDBytesInDelta.values.reduce(0, +)
+        let sumOutBps = res.perPIDBytesOutDelta.values.reduce(0, +)
+        #expect(sumInBps == res.totalInBps)
+        #expect(sumOutBps == res.totalOutBps)
+
+        let unattrSock = try #require(res.externalSocketDeltas.first(where: { $0.pid == NettopDeltaParser.unattributedPID }))
+        #expect(unattrSock.deltaBytesIn == -6_000_000)
+        #expect(unattrSock.deltaBytesOut == -30_000)
+
+        // Verify ChronoFormatter formats negative bytes & rates with leading '-' instead of "0 MB" / "0 KB/s"
+        #expect(ChronoFormatter.bytes(-6_000_000).hasPrefix("-"))
+        #expect(ChronoFormatter.rate(-3_000_000).hasPrefix("-"))
+
+        // Verify ProcessTreeSampler + FlightboxStore preserve negative discrepancy and label it "对不上的量" in ZH
+        let sampler = ProcessTreeSampler()
+        let (procs, _, _, _) = sampler.sampleTopProcesses(
+            ts: 40_002,
+            netInBpsByPID: res.perPIDBytesInDelta,
+            netOutBpsByPID: res.perPIDBytesOutDelta,
+            limit: 30
+        )
+        let procUnattr = try #require(procs.first(where: { $0.pid == NettopDeltaParser.unattributedPID }))
+        #expect(procUnattr.netInBps == -3_000_000)
+        #expect(procUnattr.netOutBps == -15_000)
+        #expect(procUnattr.localizedName(in: .zhHans) == "对不上的量")
+
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("chronomac-tr2-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        let store = try FlightboxStore(databaseURL: tmpDir.appendingPathComponent("flightbox.sqlite"))
+        try store.recordSampleBatch(
+            tick: SystemTick(
+                ts: 40_002,
+                cpuUserPct: 10,
+                cpuSysPct: 3,
+                memUsedBytes: 8_000_000_000,
+                memTotalBytes: 16_000_000_000,
+                swapUsedBytes: 0,
+                diskReadBps: 0,
+                diskWriteBps: 0,
+                netInBps: res.totalInBps,
+                netOutBps: res.totalOutBps
+            ),
+            processes: [procUnattr],
+            sockets: [
+                SocketFlowRecord(
+                    bucketHour: (40_002 / 3600) * 3600,
+                    execPath: "",
+                    processName: NettopDeltaParser.unattributedProcessToken,
+                    remoteEndpoint: NettopDeltaParser.unattributedEndpoint,
+                    protocolName: "nic",
+                    totalBytesIn: unattrSock.deltaBytesIn,
+                    totalBytesOut: unattrSock.deltaBytesOut,
+                    firstSeen: 40_002,
+                    lastSeen: 40_002
+                )
+            ],
+            anomalies: []
+        )
+
+        let (_, queriedProcs) = store.queryNearestProcesses(at: 40_002, sortBy: .network)
+        let savedProc = try #require(queriedProcs.first(where: { $0.pid == NettopDeltaParser.unattributedPID }))
+        #expect(savedProc.netInBps == -3_000_000)
+        #expect(savedProc.netOutBps == -15_000)
+        #expect(savedProc.localizedName(in: .zhHans) == "对不上的量")
+
+        let queriedFlows = store.querySocketFlows(sinceTs: 40_000, limit: 10)
+        let savedFlow = try #require(queriedFlows.first(where: { $0.isUnattributed }))
+        #expect(savedFlow.totalBytesIn == -6_000_000)
+        #expect(savedFlow.totalBytesOut == -30_000)
+        #expect(savedFlow.localizedProcessName(in: .zhHans) == "对不上的量")
     }
 }

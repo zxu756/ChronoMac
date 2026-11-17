@@ -1,9 +1,39 @@
 import ChronoMacCore
+import Darwin
 import Foundation
 import Testing
 
 @Suite("Store Tests", .timeLimit(.minutes(1)))
 struct StoreTests {
+    static func formatTimingFailureDiagnostic(elapsedMs: Double, ceilingMs: Double) -> String {
+        var loads = [Double](repeating: 0, count: 3)
+        let gotLoad = getloadavg(&loads, 3)
+        let loadAvgStr = gotLoad == 3
+            ? String(format: "%.2f %.2f %.2f", loads[0], loads[1], loads[2])
+            : "unavailable"
+        var uptimeStr = "unavailable"
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/uptime")
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+        if (try? proc.run()) != nil {
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            if let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !text.isEmpty {
+                uptimeStr = text
+            }
+        }
+        return String(
+            format: "pruneElapsedMs=%.1fms exceeded < %.1fms ceiling (loadavg=[%@], uptime: %@)",
+            elapsedMs,
+            ceilingMs,
+            loadAvgStr,
+            uptimeStr
+        )
+    }
+
     private static func onDiskStorageBytes(at dbURL: URL) -> Int64 {
         let fm = FileManager.default
         let paths = [dbURL.path, dbURL.path + "-wal", dbURL.path + "-shm"]
@@ -459,5 +489,158 @@ struct StoreTests {
 
         let (_, byNet) = store.queryNearestProcesses(at: ts, sortBy: .network)
         #expect(byNet.first?.name == "net-hog")
+    }
+
+    @Test("M1 DB Pruning: Global oldest-first hard-cap pruning preserves recent anomalies & sockets while trimming 10 MB of old snapshots fast (<1.5s)")
+    func m1GlobalOldestFirstPruningPreservesRecentAnomaliesAndSockets() throws {
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("chronomac-m1-global-oldest-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        let dbURL = tmpDir.appendingPathComponent("flightbox.sqlite")
+        let twoMB: Int64 = 2 * 1024 * 1024
+        let tenMB: Int64 = 10 * 1024 * 1024
+        let store = try FlightboxStore(databaseURL: dbURL, maxDatabaseBytes: twoMB)
+
+        let baseTs: Int64 = 1_800_500_000
+        let paddingPath = "/Applications/HeavySuite.app/Contents/MacOS/" + String(repeating: "WorkerBinary_", count: 14)
+
+        var step: Int64 = 0
+        var latestTs = baseTs
+        while Self.onDiskStorageBytes(at: dbURL) < tenMB {
+            let ts = baseTs + step * 2
+            latestTs = ts
+            let tick = SystemTick(
+                ts: ts,
+                cpuUserPct: 28.0,
+                cpuSysPct: 7.0,
+                memUsedBytes: 10_000_000_000,
+                memTotalBytes: 16_000_000_000,
+                swapUsedBytes: 128_000_000,
+                diskReadBps: 1_024_000,
+                diskWriteBps: 512_000,
+                netInBps: 64_000,
+                netOutBps: 32_000
+            )
+            var procs: [ProcessSample] = []
+            for pIdx in 0..<24 {
+                procs.append(
+                    ProcessSample(
+                        ts: ts,
+                        pid: 20_000 + pIdx,
+                        ppid: 1,
+                        name: "old-worker-\(pIdx)",
+                        execPath: "\(paddingPath)_\(pIdx)",
+                        bundleID: "com.example.old.worker.\(pIdx)",
+                        signingTeam: "TEAM123456",
+                        cpuPct: Double(pIdx) * 2.0,
+                        rssBytes: Int64(80_000_000 + pIdx * 4_000_000)
+                    )
+                )
+            }
+            try store.recordSampleBatch(tick: tick, processes: procs, sockets: [], anomalies: [])
+            step += 1
+        }
+
+        // Insert a brand-new anomaly bookmark and socket flow at the newest timestamp (`latestTs + 2`)
+        let recentTs = latestTs + 2
+        try store.recordSampleBatch(
+            tick: SystemTick(
+                ts: recentTs,
+                cpuUserPct: 88.0,
+                cpuSysPct: 9.0,
+                thermalGrade: .serious,
+                memUsedBytes: 14_000_000_000,
+                memTotalBytes: 16_000_000_000,
+                swapUsedBytes: 1_024_000_000,
+                diskReadBps: 0,
+                diskWriteBps: 0,
+                netInBps: 0,
+                netOutBps: 15_000_000
+            ),
+            processes: [
+                ProcessSample(
+                    ts: recentTs,
+                    pid: 77_777,
+                    ppid: 1,
+                    name: "recent-culprit",
+                    execPath: "/usr/local/bin/recent-culprit",
+                    cpuPct: 295.0,
+                    rssBytes: 2_000_000_000,
+                    netOutBps: 15_000_000
+                )
+            ],
+            sockets: [
+                SocketFlowRecord(
+                    bucketHour: (recentTs / 3600) * 3600,
+                    execPath: "/usr/local/bin/recent-culprit",
+                    processName: "recent-culprit",
+                    remoteEndpoint: "54.231.10.99:443",
+                    hostname: "recent.example.net",
+                    totalBytesIn: 16_000,
+                    totalBytesOut: 30_000_000,
+                    firstSeen: recentTs,
+                    lastSeen: recentTs
+                )
+            ],
+            anomalies: [
+                AnomalyBookmark(
+                    id: "recent-anom-1",
+                    ts: recentTs,
+                    kind: .runawayCPU,
+                    severity: 3,
+                    culpritName: "recent-culprit",
+                    culpritExec: "/usr/local/bin/recent-culprit",
+                    metricBadge: "295% CPU",
+                    summary: "Recent CPU spike right before retention"
+                )
+            ]
+        )
+
+        let t0 = ProcessInfo.processInfo.systemUptime
+        try store.runRollupAndRetention(now: recentTs + 2)
+        let pruneElapsedMs = (ProcessInfo.processInfo.systemUptime - t0) * 1000.0
+
+        let afterBytes = Self.onDiskStorageBytes(at: dbURL)
+        #expect(afterBytes <= twoMB)
+        let pruneDiag = pruneElapsedMs >= 1_500.0
+            ? Self.formatTimingFailureDiagnostic(elapsedMs: pruneElapsedMs, ceilingMs: 1_500.0)
+            : ""
+        #expect(pruneElapsedMs < 1_500.0, Comment(rawValue: pruneDiag))
+
+        // Global oldest-first MUST preserve the brand-new anomaly and brand-new socket flow!
+        let survivingAnomalies = store.queryAnomalies(sinceTs: baseTs, limit: 10)
+        #expect(survivingAnomalies.contains(where: { $0.id == "recent-anom-1" }))
+
+        let survivingSockets = store.querySocketFlows(sinceTs: baseTs, limit: 10)
+        #expect(survivingSockets.contains(where: { $0.remoteEndpoint == "54.231.10.99:443" }))
+
+        // Oldest timestamps must be pruned while `recentTs` survives
+        let survivingTicks = store.queryTicks(from: baseTs, to: recentTs + 2)
+        #expect(survivingTicks.last?.ts == recentTs)
+        #expect((survivingTicks.first?.ts ?? 0) > baseTs)
+    }
+
+    @Test("TR5: StoreTests prune timing failure attaches host uptime/loadavg without relaxing <1500ms, and m0-acceptance.sh resample prints measured diff without causal diagnosis")
+    func tr5PruneFailurePrintsHostLoadAndM0ResampleReportsMeasuredDiffWithoutCauseDiagnosis() throws {
+        let thisFileURL = URL(fileURLWithPath: #filePath)
+        let repoRoot = thisFileURL
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+
+        let storeTestsText = try String(contentsOf: thisFileURL, encoding: .utf8)
+        // Threshold < 1_500.0 must remain strictly un-relaxed and carry load diagnostic comment
+        #expect(storeTestsText.contains("#expect(pruneElapsedMs < 1_500.0, Comment(rawValue: pruneDiag))"))
+        #expect(storeTestsText.contains("/usr/bin/uptime"))
+
+        let m0ScriptURL = repoRoot.appendingPathComponent("Scripts/acceptance/m0-acceptance.sh")
+        let m0Text = try String(contentsOf: m0ScriptURL, encoding: .utf8)
+        #expect(!m0Text.contains("transient load spike"))
+        #expect(!m0Text.contains("'SPIKE'"))
+        #expect(m0Text.contains("measured diff=${DIFF_CPU} pp"))
+
+        let diag = Self.formatTimingFailureDiagnostic(elapsedMs: 1_820.5, ceilingMs: 1_500.0)
+        #expect(diag.contains("pruneElapsedMs=1820.5ms exceeded < 1500.0ms ceiling"))
+        #expect(diag.contains("loadavg=["))
+        #expect(!diag.contains("uptime: unavailable"))
     }
 }

@@ -112,7 +112,8 @@ public final class AppLocalizer: ObservableObject {
     public init(
         arguments: [String] = CommandLine.arguments,
         preferenceStore: any PreferenceStore = InMemoryPreferenceStore(),
-        preferredLanguages: [String] = Locale.preferredLanguages,
+        preferredLanguages: [String]? = nil,
+        environment: [String: String]? = nil,
         defaultsKey: String = AppLocalizer.bundleLanguageKey
     ) {
         self.preferenceStore = preferenceStore
@@ -121,6 +122,7 @@ public final class AppLocalizer: ObservableObject {
             arguments: arguments,
             preferenceStore: preferenceStore,
             preferredLanguages: preferredLanguages,
+            environment: environment,
             defaultsKey: defaultsKey
         )
     }
@@ -139,13 +141,15 @@ public final class AppLocalizer: ObservableObject {
     public static func configureShared(
         arguments: [String] = CommandLine.arguments,
         preferenceStore: any PreferenceStore,
-        preferredLanguages: [String] = Locale.preferredLanguages,
+        preferredLanguages: [String]? = nil,
+        environment: [String: String]? = nil,
         defaultsKey: String = AppLocalizer.bundleLanguageKey
     ) -> AppLocalizer {
         shared.configure(
             arguments: arguments,
             preferenceStore: preferenceStore,
             preferredLanguages: preferredLanguages,
+            environment: environment,
             defaultsKey: defaultsKey
         )
         return shared
@@ -154,7 +158,8 @@ public final class AppLocalizer: ObservableObject {
     public func configure(
         arguments: [String] = CommandLine.arguments,
         preferenceStore: any PreferenceStore,
-        preferredLanguages: [String] = Locale.preferredLanguages,
+        preferredLanguages: [String]? = nil,
+        environment: [String: String]? = nil,
         defaultsKey: String = AppLocalizer.bundleLanguageKey
     ) {
         self.preferenceStore = preferenceStore
@@ -163,6 +168,7 @@ public final class AppLocalizer: ObservableObject {
             arguments: arguments,
             preferenceStore: preferenceStore,
             preferredLanguages: preferredLanguages,
+            environment: environment,
             defaultsKey: defaultsKey
         )
     }
@@ -170,7 +176,8 @@ public final class AppLocalizer: ObservableObject {
     public nonisolated static func resolveLanguage(
         arguments: [String] = CommandLine.arguments,
         preferenceStore: (any PreferenceStore)? = nil,
-        preferredLanguages: [String] = Locale.preferredLanguages,
+        preferredLanguages: [String]? = nil,
+        environment: [String: String]? = nil,
         defaultsKey: String = AppLocalizer.bundleLanguageKey
     ) -> AppLanguage {
         if let cliLang = AppLanguage.parseCLIArguments(arguments) {
@@ -180,7 +187,15 @@ public final class AppLocalizer: ObservableObject {
            let parsed = AppLanguage.parse(stored) {
             return parsed
         }
-        if let firstLocale = preferredLanguages.first,
+        let effectiveEnv = environment ?? (preferredLanguages == nil ? ProcessInfo.processInfo.environment : [:])
+        for envKey in ["CHRONOMAC_LANG", "LC_ALL", "LANG"] {
+            if let rawEnv = effectiveEnv[envKey],
+               let parsedEnv = AppLanguage.parse(rawEnv) {
+                return parsedEnv
+            }
+        }
+        let effectiveLocales = preferredLanguages ?? Locale.preferredLanguages
+        if let firstLocale = effectiveLocales.first,
            firstLocale.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().hasPrefix("zh") {
             return .zhHans
         }

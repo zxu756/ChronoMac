@@ -109,16 +109,19 @@ public final class ChronoMCPServer: Sendable {
                 "Snapshot at \(ChronoFormatter.isoTimestamp(resolved)) (epoch \(resolved), \(deltaSec)s from requested time) · Ranking: \(sortOrder.label(in: .en)):"
             ]
             for p in procs.prefix(12) {
+                let procName = p.localizedName(in: .en)
                 let cpuStr = p.formattedCPU(in: .en)
-                let footprintStr = ChronoFormatter.bytes(p.memoryFootprintBytes)
-                let netOutStr = ChronoFormatter.rate(p.netOutBps)
+                let footprintStr = p.isUnattributed ? "—" : ChronoFormatter.bytes(p.memoryFootprintBytes)
+                let netOutStr = p.formattedNetworkRate(outboundOnlyForProcesses: true)
                 let livenessStr = p.livenessLabel(in: .en)
-                let pathStr = p.execPath.isEmpty ? "(path unavailable)" : ChronoFormatter.displayPath(p.execPath)
+                let pathStr = p.hasNegativeNICDiscrepancy
+                    ? "(unmatched delta: per-PID sum > physical NIC)"
+                    : (p.isUnattributed ? "(physical NIC residual)" : (p.execPath.isEmpty ? "(path unavailable)" : ChronoFormatter.displayPath(p.execPath)))
                 lines.append(
                     String(
                         format: "  PID %-6d %-24@ CPU %-13@ Memory Footprint (phys_footprint) %-10@ NetOut %-10@ [%@] %@",
                         p.pid,
-                        (p.name as NSString),
+                        (procName as NSString),
                         (cpuStr as NSString),
                         (footprintStr as NSString),
                         (netOutStr as NSString),
@@ -137,9 +140,10 @@ public final class ChronoMCPServer: Sendable {
             }
             var lines = ["Top External Socket Flows (last \(hours)h, loopback excluded):"]
             for f in flows {
-                let host = f.hostname ?? f.remoteEndpoint
+                let procName = f.localizedProcessName(in: .en)
+                let host = f.localizedEndpoint(in: .en)
                 let pathNote = f.execPath.isEmpty ? "" : " (\(ChronoFormatter.displayPath(f.execPath)))"
-                lines.append("  \(f.processName)\(pathNote) -> \(host) | Out: \(ChronoFormatter.bytes(f.totalBytesOut)) | In: \(ChronoFormatter.bytes(f.totalBytesIn))")
+                lines.append("  \(procName)\(pathNote) -> \(host) | Out: \(ChronoFormatter.bytes(f.totalBytesOut)) | In: \(ChronoFormatter.bytes(f.totalBytesIn))")
             }
             return lines.joined(separator: "\n")
 

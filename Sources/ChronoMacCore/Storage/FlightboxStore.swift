@@ -142,6 +142,7 @@ public final class FlightboxStore: @unchecked Sendable {
         PRAGMA journal_mode = WAL;
         PRAGMA synchronous = NORMAL;
         PRAGMA temp_store = MEMORY;
+        PRAGMA cache_size = -4096;
 
         CREATE TABLE IF NOT EXISTS system_ticks (
             ts INTEGER PRIMARY KEY,
@@ -208,6 +209,12 @@ public final class FlightboxStore: @unchecked Sendable {
             summary TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_anomaly_ts ON anomaly_bookmarks(ts DESC);
+
+        CREATE TABLE IF NOT EXISTS recorder_gaps (
+            ts INTEGER PRIMARY KEY,
+            reason TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_recorder_gaps_ts ON recorder_gaps(ts DESC);
         """
         try execRaw(ddl)
 
@@ -228,6 +235,25 @@ public final class FlightboxStore: @unchecked Sendable {
         if rc != SQLITE_OK {
             let msg = errMsg.map { String(cString: $0) } ?? "SQLite error \(rc)"
             sqlite3_free(errMsg)
+            throw NSError(domain: "ChronoMac.FlightboxStore", code: Int(rc), userInfo: [NSLocalizedDescriptionKey: msg])
+        }
+    }
+
+    private func prepareChecked(_ sql: String, db: OpaquePointer) throws -> OpaquePointer {
+        var stmt: OpaquePointer?
+        let rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
+        guard rc == SQLITE_OK, let prepared = stmt else {
+            let msg = sqlite3_errmsg(db).map { String(cString: $0) } ?? "SQLite prepare error \(rc)"
+            if let stmt { sqlite3_finalize(stmt) }
+            throw NSError(domain: "ChronoMac.FlightboxStore", code: Int(rc), userInfo: [NSLocalizedDescriptionKey: msg])
+        }
+        return prepared
+    }
+
+    private func stepDoneChecked(_ stmt: OpaquePointer, db: OpaquePointer) throws {
+        let rc = sqlite3_step(stmt)
+        if rc != SQLITE_DONE && rc != SQLITE_ROW {
+            let msg = sqlite3_errmsg(db).map { String(cString: $0) } ?? "SQLite step error \(rc)"
             throw NSError(domain: "ChronoMac.FlightboxStore", code: Int(rc), userInfo: [NSLocalizedDescriptionKey: msg])
         }
     }
@@ -286,9 +312,28 @@ public final class FlightboxStore: @unchecked Sendable {
             }
             try execRaw("COMMIT;")
         } catch {
-            try? execRaw("ROLLBACK;")
+            if sqlite3_get_autocommit(db) == 0 {
+                try? execRaw("ROLLBACK;")
+            }
             throw error
         }
+    }
+
+    public func recordSamplingGap(ts: Int64, reason: String) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let db, !isReadOnly else { return }
+
+        let sql = """
+        INSERT INTO recorder_gaps (ts, reason)
+        VALUES (?, ?)
+        ON CONFLICT(ts) DO UPDATE SET reason = excluded.reason;
+        """
+        let s = try prepareChecked(sql, db: db)
+        defer { sqlite3_finalize(s) }
+        sqlite3_bind_int64(s, 1, ts)
+        sqlite3_bind_text(s, 2, reason, -1, SQLITE_TRANSIENT_DESTRUCTOR)
+        try stepDoneChecked(s, db: db)
     }
 
     private func insertTick(_ t: SystemTick, db: OpaquePointer) throws {
@@ -319,8 +364,7 @@ public final class FlightboxStore: @unchecked Sendable {
                 ELSE system_ticks.active_agent_summary
             END;
         """
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let s = stmt else { return }
+        let s = try prepareChecked(sql, db: db)
         defer { sqlite3_finalize(s) }
 
         sqlite3_bind_int64(s, 1, t.ts)
@@ -339,7 +383,7 @@ public final class FlightboxStore: @unchecked Sendable {
         sqlite3_bind_int64(s, 14, t.loopbackOutBps)
         sqlite3_bind_int(s, 15, Int32(t.activeAgentCount))
         sqlite3_bind_text(s, 16, t.activeAgentSummary, -1, SQLITE_TRANSIENT_DESTRUCTOR)
-        _ = sqlite3_step(s)
+        try stepDoneChecked(s, db: db)
     }
 
     private func insertProcess(_ p: ProcessSample, db: OpaquePointer) throws {
@@ -349,8 +393,7 @@ public final class FlightboxStore: @unchecked Sendable {
             cpu_pct, rss_bytes, disk_read_bps, disk_write_bps, net_in_bps, net_out_bps
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let s = stmt else { return }
+        let s = try prepareChecked(sql, db: db)
         defer { sqlite3_finalize(s) }
 
         sqlite3_bind_int64(s, 1, p.ts)
@@ -375,7 +418,7 @@ public final class FlightboxStore: @unchecked Sendable {
         sqlite3_bind_int64(s, 11, p.diskWriteBps)
         sqlite3_bind_int64(s, 12, p.netInBps)
         sqlite3_bind_int64(s, 13, p.netOutBps)
-        _ = sqlite3_step(s)
+        try stepDoneChecked(s, db: db)
     }
 
     private func upsertSocket(_ rec: SocketFlowRecord, db: OpaquePointer) throws {
@@ -393,8 +436,7 @@ public final class FlightboxStore: @unchecked Sendable {
             hostname = COALESCE(excluded.hostname, socket_ledger.hostname),
             last_seen = MAX(socket_ledger.last_seen, excluded.last_seen);
         """
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let s = stmt else { return }
+        let s = try prepareChecked(sql, db: db)
         defer { sqlite3_finalize(s) }
 
         sqlite3_bind_int64(s, 1, rec.bucketHour)
@@ -411,7 +453,7 @@ public final class FlightboxStore: @unchecked Sendable {
         sqlite3_bind_int64(s, 8, rec.totalBytesOut)
         sqlite3_bind_int64(s, 9, rec.firstSeen)
         sqlite3_bind_int64(s, 10, rec.lastSeen)
-        _ = sqlite3_step(s)
+        try stepDoneChecked(s, db: db)
     }
 
     private func insertAnomaly(_ a: AnomalyBookmark, db: OpaquePointer) throws {
@@ -420,8 +462,7 @@ public final class FlightboxStore: @unchecked Sendable {
             id, ts, kind, severity, culprit_name, culprit_exec, metric_badge, summary
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
         """
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let s = stmt else { return }
+        let s = try prepareChecked(sql, db: db)
         defer { sqlite3_finalize(s) }
 
         sqlite3_bind_text(s, 1, a.id, -1, SQLITE_TRANSIENT_DESTRUCTOR)
@@ -432,7 +473,7 @@ public final class FlightboxStore: @unchecked Sendable {
         sqlite3_bind_text(s, 6, a.culpritExec, -1, SQLITE_TRANSIENT_DESTRUCTOR)
         sqlite3_bind_text(s, 7, a.metricBadge, -1, SQLITE_TRANSIENT_DESTRUCTOR)
         sqlite3_bind_text(s, 8, a.summary, -1, SQLITE_TRANSIENT_DESTRUCTOR)
-        _ = sqlite3_step(s)
+        try stepDoneChecked(s, db: db)
     }
 
     public func updateHostname(for remoteEndpoint: String, hostname: String) {
@@ -448,11 +489,18 @@ public final class FlightboxStore: @unchecked Sendable {
         _ = sqlite3_step(s)
     }
 
+    public func checkpointWAL() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isReadOnly, db != nil else { return }
+        try? execRaw("PRAGMA wal_checkpoint(TRUNCATE);")
+    }
+
     // MARK: - 3-Tier Peak-Preserving Rollup & Hard Storage Cap
 
     /// Compacts completed Tier 0 buckets (< now-2h) into 15s buckets, completed Tier 1 buckets (< now-24h)
     /// into 60s buckets, prunes data older than 7 days, reclaims free pages, and enforces `maxDatabaseBytes`
-    /// across `.sqlite` + `-wal` + `-shm` without any 48-hour immunity window.
+    /// globally oldest-first across `.sqlite` + `-wal` + `-shm` without any 48-hour immunity window.
     public func runRollupAndRetention(now: Int64) throws {
         lock.lock()
         defer { lock.unlock() }
@@ -475,6 +523,7 @@ public final class FlightboxStore: @unchecked Sendable {
             DELETE FROM process_snapshots WHERE ts < \(sevenDaysAgo);
             DELETE FROM socket_ledger WHERE last_seen < \(sevenDaysAgo);
             DELETE FROM anomaly_bookmarks WHERE ts < \(sevenDaysAgo);
+            DELETE FROM recorder_gaps WHERE ts < \(sevenDaysAgo);
             """)
             try execRaw("COMMIT;")
         } catch {
@@ -487,16 +536,10 @@ public final class FlightboxStore: @unchecked Sendable {
         let freePages = querySingleInt64("PRAGMA freelist_count;")
         let totalPages = max(1, querySingleInt64("PRAGMA page_count;"))
         if totalStorageBytes() > maxDatabaseBytes || walFileBytes() >= walThreshold || (freePages > 128 && freePages * 4 > totalPages) {
-            let autoVacMode = querySingleInt64("PRAGMA auto_vacuum;")
-            if autoVacMode == 2 {
-                try? execRaw("PRAGMA incremental_vacuum;")
-            } else if freePages > 64 {
-                try? execRaw("VACUUM;")
-            }
-            try? execRaw("PRAGMA wal_checkpoint(TRUNCATE);")
+            reclaimStoragePages()
         }
 
-        // Enforce hard storage ceiling (sqlite + wal + shm <= maxDatabaseBytes), oldest-first, no 48h immunity
+        // Enforce hard storage ceiling (sqlite + wal + shm <= maxDatabaseBytes), globally oldest-first, no 48h immunity
         var guardIterations = 0
         while totalStorageBytes() > maxDatabaseBytes && guardIterations < 40 {
             guardIterations += 1
@@ -504,43 +547,76 @@ public final class FlightboxStore: @unchecked Sendable {
             let tickCount = querySingleInt64("SELECT COUNT(*) FROM system_ticks;")
             let sockCount = querySingleInt64("SELECT COUNT(*) FROM socket_ledger;")
             let anomCount = querySingleInt64("SELECT COUNT(*) FROM anomaly_bookmarks;")
+            let gapCount = querySingleInt64("SELECT COUNT(*) FROM recorder_gaps;")
+            let totalRows = procCount + tickCount + sockCount + anomCount + gapCount
 
-            if procCount == 0 && tickCount == 0 && sockCount == 0 && anomCount == 0 {
+            if totalRows == 0 {
                 try execRaw("VACUUM;")
                 try execRaw("PRAGMA wal_checkpoint(TRUNCATE);")
                 break
             }
 
-            let procTrim = procCount > 0 ? max(1, procCount / 5) : 0
-            let tickTrim = tickCount > 0 ? max(1, tickCount / 5) : 0
-            let sockTrim = sockCount > 0 ? max(1, sockCount / 5) : 0
-            let anomTrim = anomCount > 0 ? max(1, anomCount / 5) : 0
+            let offsetIdx = max(0, totalRows / 5 - 1)
+            let cutoffTs = querySingleInt64("""
+            SELECT ts FROM (
+                SELECT ts FROM process_snapshots
+                UNION ALL
+                SELECT ts FROM system_ticks
+                UNION ALL
+                SELECT last_seen AS ts FROM socket_ledger
+                UNION ALL
+                SELECT ts FROM anomaly_bookmarks
+                UNION ALL
+                SELECT ts FROM recorder_gaps
+            )
+            ORDER BY ts ASC
+            LIMIT 1 OFFSET \(offsetIdx);
+            """)
+            let globalMaxTs = querySingleInt64("""
+            SELECT MAX(ts) FROM (
+                SELECT MAX(ts) AS ts FROM process_snapshots
+                UNION ALL
+                SELECT MAX(ts) AS ts FROM system_ticks
+                UNION ALL
+                SELECT MAX(last_seen) AS ts FROM socket_ledger
+                UNION ALL
+                SELECT MAX(ts) AS ts FROM anomaly_bookmarks
+                UNION ALL
+                SELECT MAX(ts) AS ts FROM recorder_gaps
+            );
+            """)
 
             try execRaw("BEGIN IMMEDIATE TRANSACTION;")
             do {
-                if procTrim > 0 {
+                if cutoffTs < globalMaxTs {
                     try execRaw("""
-                    DELETE FROM process_snapshots
-                    WHERE rowid IN (SELECT rowid FROM process_snapshots ORDER BY ts ASC, rowid ASC LIMIT \(procTrim));
+                    DELETE FROM process_snapshots WHERE ts <= \(cutoffTs);
+                    DELETE FROM system_ticks WHERE ts <= \(cutoffTs);
+                    DELETE FROM socket_ledger WHERE last_seen <= \(cutoffTs);
+                    DELETE FROM anomaly_bookmarks WHERE ts <= \(cutoffTs);
+                    DELETE FROM recorder_gaps WHERE ts <= \(cutoffTs);
                     """)
-                }
-                if tickTrim > 0 {
-                    try execRaw("""
-                    DELETE FROM system_ticks
-                    WHERE rowid IN (SELECT rowid FROM system_ticks ORDER BY ts ASC, rowid ASC LIMIT \(tickTrim));
-                    """)
-                }
-                if sockTrim > 0 {
-                    try execRaw("""
-                    DELETE FROM socket_ledger
-                    WHERE rowid IN (SELECT rowid FROM socket_ledger ORDER BY last_seen ASC, rowid ASC LIMIT \(sockTrim));
-                    """)
-                }
-                if anomTrim > 0 {
-                    try execRaw("""
-                    DELETE FROM anomaly_bookmarks
-                    WHERE rowid IN (SELECT rowid FROM anomaly_bookmarks ORDER BY ts ASC, rowid ASC LIMIT \(anomTrim));
-                    """)
+                } else {
+                    let procTrim = procCount > 0 ? max(1, procCount / 5) : 0
+                    let tickTrim = tickCount > 0 ? max(1, tickCount / 5) : 0
+                    let sockTrim = sockCount > 0 ? max(1, sockCount / 5) : 0
+                    let anomTrim = anomCount > 0 ? max(1, anomCount / 5) : 0
+                    let gapTrim = gapCount > 0 ? max(1, gapCount / 5) : 0
+                    if procTrim > 0 {
+                        try execRaw("DELETE FROM process_snapshots WHERE rowid IN (SELECT rowid FROM process_snapshots ORDER BY ts ASC, rowid ASC LIMIT \(procTrim));")
+                    }
+                    if tickTrim > 0 {
+                        try execRaw("DELETE FROM system_ticks WHERE rowid IN (SELECT rowid FROM system_ticks ORDER BY ts ASC, rowid ASC LIMIT \(tickTrim));")
+                    }
+                    if sockTrim > 0 {
+                        try execRaw("DELETE FROM socket_ledger WHERE rowid IN (SELECT rowid FROM socket_ledger ORDER BY last_seen ASC, rowid ASC LIMIT \(sockTrim));")
+                    }
+                    if anomTrim > 0 {
+                        try execRaw("DELETE FROM anomaly_bookmarks WHERE rowid IN (SELECT rowid FROM anomaly_bookmarks ORDER BY ts ASC, rowid ASC LIMIT \(anomTrim));")
+                    }
+                    if gapTrim > 0 {
+                        try execRaw("DELETE FROM recorder_gaps WHERE rowid IN (SELECT rowid FROM recorder_gaps ORDER BY ts ASC, rowid ASC LIMIT \(gapTrim));")
+                    }
                 }
                 try execRaw("COMMIT;")
             } catch {
@@ -548,8 +624,23 @@ public final class FlightboxStore: @unchecked Sendable {
                 throw error
             }
 
-            try execRaw("VACUUM;")
-            try execRaw("PRAGMA wal_checkpoint(TRUNCATE);")
+            reclaimStoragePages(forceFallbackVacuumIfUnchanged: true)
+        }
+    }
+
+    private func reclaimStoragePages(forceFallbackVacuumIfUnchanged: Bool = false) {
+        let beforeBytes = totalStorageBytes()
+        let autoVacMode = querySingleInt64("PRAGMA auto_vacuum;")
+        if autoVacMode == 2 {
+            try? execRaw("PRAGMA incremental_vacuum;")
+            try? execRaw("PRAGMA wal_checkpoint(TRUNCATE);")
+            if forceFallbackVacuumIfUnchanged && totalStorageBytes() >= beforeBytes {
+                try? execRaw("VACUUM;")
+                try? execRaw("PRAGMA wal_checkpoint(TRUNCATE);")
+            }
+        } else {
+            try? execRaw("VACUUM;")
+            try? execRaw("PRAGMA wal_checkpoint(TRUNCATE);")
         }
     }
 
@@ -747,8 +838,8 @@ public final class FlightboxStore: @unchecked Sendable {
             """
         case .network:
             orderClause = """
-            (net_out_bps + net_in_bps) DESC,
-            net_out_bps DESC,
+            (ABS(net_out_bps) + ABS(net_in_bps)) DESC,
+            ABS(net_out_bps) DESC,
             rss_bytes DESC,
             pid ASC
             """
@@ -771,7 +862,7 @@ public final class FlightboxStore: @unchecked Sendable {
         var list: [ProcessSample] = []
         while sqlite3_step(s) == SQLITE_ROW {
             let pid = Int(sqlite3_column_int(s, 1))
-            let alive = livePIDs.map { $0.contains(pid) } ?? true
+            let alive = (pid == NettopDeltaParser.unattributedPID) ? true : (livePIDs.map { $0.contains(pid) } ?? true)
             let rawCPU = sqlite3_column_double(s, 7)
             let cpuReadable = rawCPU >= 0.0
             list.append(
@@ -797,6 +888,105 @@ public final class FlightboxStore: @unchecked Sendable {
         return (resolvedTs, list)
     }
 
+    public func queryHistoricalProcesses(
+        from startTs: Int64,
+        to endTs: Int64,
+        livePIDs: Set<Int>? = nil,
+        sortBy: ProcessSortOrder = .cpu,
+        nameFilter: String? = nil,
+        limit: Int = 25
+    ) -> [ProcessSample] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let db else { return [] }
+
+        let orderClause: String
+        switch sortBy {
+        case .cpu:
+            orderClause = """
+            CASE WHEN MAX(cpu_pct) >= 0 THEN 0 ELSE 1 END ASC,
+            MAX(cpu_pct) DESC,
+            MAX(rss_bytes) DESC,
+            MAX(net_out_bps + net_in_bps) DESC,
+            pid ASC
+            """
+        case .memory:
+            orderClause = """
+            MAX(rss_bytes) DESC,
+            CASE WHEN MAX(cpu_pct) >= 0 THEN MAX(cpu_pct) ELSE 0 END DESC,
+            MAX(net_out_bps + net_in_bps) DESC,
+            pid ASC
+            """
+        case .network:
+            orderClause = """
+            (MAX(ABS(net_out_bps)) + MAX(ABS(net_in_bps))) DESC,
+            MAX(ABS(net_out_bps)) DESC,
+            MAX(rss_bytes) DESC,
+            pid ASC
+            """
+        }
+
+        let trimmedFilter = nameFilter?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let hasFilter = !trimmedFilter.isEmpty
+        let filterClause = hasFilter
+            ? "AND (LOWER(name) LIKE ? OR LOWER(exec_path) LIKE ?)"
+            : ""
+
+        let sql = """
+        SELECT MAX(ts), pid, MAX(ppid), name, exec_path, MAX(bundle_id), MAX(signing_team),
+               MAX(cpu_pct), MAX(rss_bytes), MAX(disk_read_bps), MAX(disk_write_bps),
+               CASE WHEN MIN(net_in_bps) < 0 THEN MIN(net_in_bps) ELSE MAX(net_in_bps) END,
+               CASE WHEN MIN(net_out_bps) < 0 THEN MIN(net_out_bps) ELSE MAX(net_out_bps) END
+        FROM process_snapshots
+        WHERE ts >= ? AND ts <= ? \(filterClause)
+        GROUP BY pid, name, exec_path
+        ORDER BY \(orderClause)
+        LIMIT ?;
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let s = stmt else { return [] }
+        defer { sqlite3_finalize(s) }
+
+        sqlite3_bind_int64(s, 1, startTs)
+        sqlite3_bind_int64(s, 2, endTs)
+        if hasFilter {
+            let pattern = "%" + trimmedFilter.lowercased() + "%"
+            sqlite3_bind_text(s, 3, pattern, -1, SQLITE_TRANSIENT_DESTRUCTOR)
+            sqlite3_bind_text(s, 4, pattern, -1, SQLITE_TRANSIENT_DESTRUCTOR)
+            sqlite3_bind_int(s, 5, Int32(limit))
+        } else {
+            sqlite3_bind_int(s, 3, Int32(limit))
+        }
+
+        var list: [ProcessSample] = []
+        while sqlite3_step(s) == SQLITE_ROW {
+            let pid = Int(sqlite3_column_int(s, 1))
+            let alive = (pid == NettopDeltaParser.unattributedPID) ? true : (livePIDs.map { $0.contains(pid) } ?? true)
+            let rawCPU = sqlite3_column_double(s, 7)
+            let cpuReadable = rawCPU >= 0.0
+            list.append(
+                ProcessSample(
+                    ts: sqlite3_column_int64(s, 0),
+                    pid: pid,
+                    ppid: Int(sqlite3_column_int(s, 2)),
+                    name: sqlite3_column_text(s, 3).map { String(cString: $0) } ?? "unknown",
+                    execPath: sqlite3_column_text(s, 4).map { String(cString: $0) } ?? "",
+                    bundleID: sqlite3_column_text(s, 5).map { String(cString: $0) },
+                    signingTeam: sqlite3_column_text(s, 6).map { String(cString: $0) },
+                    cpuPct: cpuReadable ? rawCPU : 0.0,
+                    rssBytes: sqlite3_column_int64(s, 8),
+                    diskReadBps: sqlite3_column_int64(s, 9),
+                    diskWriteBps: sqlite3_column_int64(s, 10),
+                    netInBps: sqlite3_column_int64(s, 11),
+                    netOutBps: sqlite3_column_int64(s, 12),
+                    isAliveNow: alive,
+                    isCPUReadable: cpuReadable
+                )
+            )
+        }
+        return list
+    }
+
     public func querySocketFlows(sinceTs: Int64, execPathFilter: String? = nil, limit: Int = 25) -> [SocketFlowRecord] {
         lock.lock()
         defer { lock.unlock() }
@@ -810,7 +1000,7 @@ public final class FlightboxStore: @unchecked Sendable {
             FROM socket_ledger
             WHERE last_seen >= ? AND exec_path = ?
             GROUP BY exec_path, process_name, remote_endpoint
-            ORDER BY (SUM(total_bytes_out) + SUM(total_bytes_in)) DESC
+            ORDER BY (ABS(SUM(total_bytes_out)) + ABS(SUM(total_bytes_in))) DESC
             LIMIT ?;
             """
         } else {
@@ -820,7 +1010,7 @@ public final class FlightboxStore: @unchecked Sendable {
             FROM socket_ledger
             WHERE last_seen >= ?
             GROUP BY exec_path, process_name, remote_endpoint
-            ORDER BY (SUM(total_bytes_out) + SUM(total_bytes_in)) DESC
+            ORDER BY (ABS(SUM(total_bytes_out)) + ABS(SUM(total_bytes_in))) DESC
             LIMIT ?;
             """
         }
@@ -892,5 +1082,31 @@ public final class FlightboxStore: @unchecked Sendable {
             )
         }
         return out
+    }
+
+    public func querySamplingGaps(from startTs: Int64, to endTs: Int64) -> [SamplingGapRecord] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let db else { return [] }
+
+        let sql = """
+        SELECT ts, reason
+        FROM recorder_gaps
+        WHERE ts >= ? AND ts <= ?
+        ORDER BY ts ASC;
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let s = stmt else { return [] }
+        defer { sqlite3_finalize(s) }
+        sqlite3_bind_int64(s, 1, startTs)
+        sqlite3_bind_int64(s, 2, endTs)
+
+        var gaps: [SamplingGapRecord] = []
+        while sqlite3_step(s) == SQLITE_ROW {
+            let ts = sqlite3_column_int64(s, 0)
+            let reason = sqlite3_column_text(s, 1).map { String(cString: $0) } ?? ""
+            gaps.append(SamplingGapRecord(ts: ts, reason: reason))
+        }
+        return gaps
     }
 }

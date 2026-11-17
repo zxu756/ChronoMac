@@ -1,0 +1,16 @@
+# Recorded real 2-tick nettop capture on macOS 27.0.1 (Build 26A434, arm64) — NOT synthetic
+# Capture timestamps (UTC): tick1=2026-11-15T04:09:58Z, tick2=2026-11-15T04:09:58Z
+# Exact command: /usr/bin/nettop -L 1 -n -J interface,state,bytes_in,bytes_out -p 9122
+# Traffic generated between tick 1 and tick 2: 655,360 bytes (640 KiB) over 127.0.0.1 TCP loopback (offline, zero internet)
+=== TICK 1 ===
+,interface,state,bytes_in,bytes_out,
+Python.9122,,,2048,2048,
+tcp4 127.0.0.1:63270<->127.0.0.1:63271,lo0,Established,2048,0,
+tcp4 127.0.0.1:63271<->127.0.0.1:63270,lo0,Established,0,2048,
+tcp4 127.0.0.1:63270<->*:*,lo0,Listen,,,
+=== TICK 2 ===
+,interface,state,bytes_in,bytes_out,
+Python.9122,,,657408,657408,
+tcp4 127.0.0.1:63270<->127.0.0.1:63271,lo0,Established,657408,0,
+tcp4 127.0.0.1:63271<->127.0.0.1:63270,lo0,Established,0,657408,
+tcp4 127.0.0.1:63270<->*:*,lo0,Listen,,,

@@ -107,7 +107,22 @@ def assert_tokens(cmd, doc_name, out):
         return
 
     is_zh = ("--lang zh" in cmd)
-    if "status" in cmd:
+    if re.search(r"\brecord\b", cmd):
+        if is_zh:
+            assert "ChronoMac 后台录制已安全停止" in out, f"Missing ZH record stop message in {cmd}:\n{out}"
+        else:
+            assert "ChronoMac recorder stopped cleanly" in out, f"Missing EN record stop message in {cmd}:\n{out}"
+    elif "install-agent" in cmd:
+        for tok in ("<?xml", "<plist", "io.github.zxu756.ChronoMac.record"):
+            assert tok in out, f"Missing '{tok}' in {cmd} output:\n{out}"
+    elif "history" in cmd:
+        if is_zh:
+            for tok in ("ChronoMac 历史进程归档", "物理内存占用 (phys_footprint)"):
+                assert tok in out, f"Missing '{tok}' in {cmd} output:\n{out}"
+        else:
+            for tok in ("ChronoMac Historical Process Archive", "Memory Footprint (phys_footprint)"):
+                assert tok in out, f"Missing '{tok}' in {cmd} output:\n{out}"
+    elif "status" in cmd:
         if is_zh:
             for tok in ("ChronoMac 飞行记录库:", "实时主机 (1.0 秒双次采样校准) | CPU:"):
                 assert tok in out, f"Missing '{tok}' in {cmd} output:\n{out}"

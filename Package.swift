@@ -30,6 +30,7 @@ let package = Package(
         .testTarget(
             name: "ChronoMacCoreTests",
             dependencies: ["ChronoMacCore"],
+            exclude: ["Fixtures"],
             swiftSettings: testSwiftSettings
         )
     ],

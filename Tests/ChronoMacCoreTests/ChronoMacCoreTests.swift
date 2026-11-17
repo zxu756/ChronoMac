@@ -276,6 +276,36 @@ struct ChronoMacCoreTests {
         #expect(cliOverrideZH.language == .zhHans)
         #expect(ThermalGrade.serious.label(in: .zhHans) == "降频限温")
         #expect(AnomalyKind.swapSurge.label(in: .zhHans) == "交换激增")
+
+        // 6. POSIX LANG / LC_ALL environment overrides macOS system preferredLanguages when --lang & PreferenceStore are unset
+        let emptyPrefs = InMemoryPreferenceStore()
+        let posixEN = AppLocalizer(
+            arguments: ["ChronoMac", "record"],
+            preferenceStore: emptyPrefs,
+            preferredLanguages: ["zh-Hans-NZ"],
+            environment: ["LANG": "en_US.UTF-8"],
+            defaultsKey: key
+        )
+        #expect(posixEN.language == .en)
+
+        let posixZH = AppLocalizer(
+            arguments: ["ChronoMac", "record"],
+            preferenceStore: emptyPrefs,
+            preferredLanguages: ["en-US"],
+            environment: ["LC_ALL": "zh_CN.UTF-8", "LANG": "en_US.UTF-8"],
+            defaultsKey: key
+        )
+        #expect(posixZH.language == .zhHans)
+
+        // C / POSIX neutral locale falls back cleanly to system preferredLanguages
+        let posixCFallback = AppLocalizer(
+            arguments: ["ChronoMac", "record"],
+            preferenceStore: emptyPrefs,
+            preferredLanguages: ["zh-Hans-CN"],
+            environment: ["LANG": "C"],
+            defaultsKey: key
+        )
+        #expect(posixCFallback.language == .zhHans)
     }
 
     @Test("T18: AppLocalizer default init uses isolated in-memory store without touching UserDefaults.standard and Sources contain zero runtime bundle/test checks")
@@ -348,6 +378,95 @@ struct ChronoMacCoreTests {
             defaultsKey: testKey
         )
         #expect(reloadedLoc.language == .zhHans)
+    }
+
+    @Test("T18 & T20: Behavioral PreferenceStore injection works identically in CLI non-.app execution without touching UserDefaults.standard")
+    @MainActor
+    func t18BehavioralPreferenceStoreInjectionInCLIModeWithoutBundle() throws {
+        let testKey = AppLocalizer.bundleLanguageKey
+        let beforeStandard = UserDefaults.standard.object(forKey: testKey) as? String
+
+        let spyStore = RecordingPreferenceStore(initial: [testKey: "zh-Hans"])
+        let nonBundleArgs = ["/tmp/headless-bin/ChronoMac", "--cli", "help"]
+
+        // 1. AppLocalizer in non-.app CLI path must read from injected PreferenceStore despite en-US system locale
+        let cliLocalizer = AppLocalizer(
+            arguments: nonBundleArgs,
+            preferenceStore: spyStore,
+            preferredLanguages: ["en-US"],
+            defaultsKey: testKey
+        )
+        #expect(cliLocalizer.language == .zhHans)
+        #expect(spyStore.readCount >= 1)
+
+        // 2. Writing/toggling in non-.app CLI path must persist to injected PreferenceStore, never UserDefaults.standard
+        cliLocalizer.toggle()
+        #expect(cliLocalizer.language == .en)
+        #expect(spyStore.writeCount == 1)
+        #expect(spyStore.string(forKey: testKey) == "en")
+        cliLocalizer.toggle()
+        #expect(cliLocalizer.language == .zhHans)
+        #expect(spyStore.writeCount == 2)
+        #expect(spyStore.string(forKey: testKey) == "zh-Hans")
+
+        // 3. ChronoCLIRunner.execute honors injected PreferenceStore in non-.app mode when --lang is omitted
+        var outZH = ""
+        var errZH = ""
+        let rcZH = ChronoCLIRunner.execute(
+            arguments: nonBundleArgs,
+            preferenceStore: spyStore,
+            preferredLanguages: ["en-US"],
+            stdout: &outZH,
+            stderr: &errZH
+        )
+        #expect(rcZH == 0)
+        #expect(outZH.contains("用法:"))
+        #expect(errZH.isEmpty)
+
+        spyStore.set("en", forKey: testKey)
+        var outEN = ""
+        var errEN = ""
+        let rcEN = ChronoCLIRunner.execute(
+            arguments: nonBundleArgs,
+            preferenceStore: spyStore,
+            preferredLanguages: ["zh-Hans-CN"],
+            stdout: &outEN,
+            stderr: &errEN
+        )
+        #expect(rcEN == 0)
+        #expect(outEN.contains("Usage:"))
+        #expect(errEN.isEmpty)
+
+        #expect(UserDefaults.standard.object(forKey: testKey) as? String == beforeStandard)
+    }
+}
+
+private final class RecordingPreferenceStore: PreferenceStore, @unchecked Sendable {
+    private var storage: [String: String]
+    private let lock = NSLock()
+    private(set) var readCount: Int = 0
+    private(set) var writeCount: Int = 0
+
+    init(initial: [String: String] = [:]) {
+        self.storage = initial
+    }
+
+    func string(forKey defaultName: String) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        readCount += 1
+        return storage[defaultName]
+    }
+
+    func set(_ value: Any?, forKey defaultName: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        writeCount += 1
+        if let str = value as? String {
+            storage[defaultName] = str
+        } else if value == nil {
+            storage.removeValue(forKey: defaultName)
+        }
     }
 }
 

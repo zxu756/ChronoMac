@@ -1,0 +1,42 @@
+# SYNTHETIC FIXTURE (synthetic_nic_40mb_calibration.txt)
+# Purpose: Deterministic offline verification of M1 physical NIC byte-counter calibration (`netstat -ib` / `NET_RT_IFLIST2`)
+# vs per-process `nettop` attribution + `"Unattributed"` / `"未归属"` residual without touching external networks.
+# Scenario (dt = 2.0s):
+#   - Physical Wi-Fi interface `en1` receives +40,000,000 bytes (296,729,214,752 -> 296,769,214,752) and sends +80,000 bytes.
+#   - Loopback `lo0` transfers +209,715,200 bytes (200 MiB) simultaneously — MUST remain 100% excluded from external totals.
+#   - Virtual tunnel `utun0` carries +10,000,000 bytes encapsulated over `en1` — MUST NOT be double-counted on top of `en1`.
+#   - `curl.999` in `nettop` accounts for +36,000,000 bytes inbound (90.0% >= 80%) and +64,000 bytes outbound.
+#   - Pre-existing `apsd.140` transfers 0 bytes and MUST receive 0 smeared bytes.
+#   - Residual gap (+4,000,000 bytes inbound = 2,000,000 B/s; +16,000 bytes outbound = 8,000 B/s) MUST be recorded as `"Unattributed"` / `"未归属"`.
+=== NETSTAT TICK 1 ===
+Name       Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes  Coll
+lo0        16384 <Link#1>                      84210000     0 12000000000 84210000     0 12000000000     0
+lo0        16384 127           127.0.0.1       84210000     - 12000000000 84210000     - 12000000000     -
+en0        1500  <Link#4>      aa:bb:cc:dd:ee:00      0     0          0        0     0          0     0
+en1        1500  <Link#6>      aa:bb:cc:dd:ee:01 198000000  0 296729214752 142000000 0 291177527747     0
+en1        1500  192.168.1     192.168.1.25    198000000    - 296729214752 142000000 - 291177527747     -
+bridge0    1500  <Link#11>     aa:bb:cc:dd:ee:02   1000     0     500000     1000     0     500000     0
+utun0      1380  <Link#18>                        50000     0   50000000    50000     0   20000000     0
+=== NETSTAT TICK 2 ===
+Name       Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes  Coll
+lo0        16384 <Link#1>                      84350000     0 12209715200 84350000     0 12209715200     0
+lo0        16384 127           127.0.0.1       84350000     - 12209715200 84350000     - 12209715200     -
+en0        1500  <Link#4>      aa:bb:cc:dd:ee:00      0     0          0        0     0          0     0
+en1        1500  <Link#6>      aa:bb:cc:dd:ee:01 198028000  0 296769214752 142001200 0 291177607747     0
+en1        1500  192.168.1     192.168.1.25    198028000    - 296769214752 142001200 - 291177607747     -
+bridge0    1500  <Link#11>     aa:bb:cc:dd:ee:02   1000     0     500000     1000     0     500000     0
+utun0      1380  <Link#18>                        58000     0   60000000    52000     0   21000000     0
+=== NETTOP TICK 1 ===
+,interface,state,bytes_in,bytes_out,
+apsd.140,,,12000,8000,
+tcp4 192.168.1.25:50000<->17.57.145.41:5223,en1,Established,12000,8000,
+local-loop.8080,,,1000,1000,
+tcp4 127.0.0.1:51000<->127.0.0.1:8080,lo0,Established,1000,1000,
+=== NETTOP TICK 2 ===
+,interface,state,bytes_in,bytes_out,
+apsd.140,,,12000,8000,
+tcp4 192.168.1.25:50000<->17.57.145.41:5223,en1,Established,12000,8000,
+curl.999,,,36000000,64000,
+tcp4 192.168.1.25:54321<->151.101.1.140:443,en1,Established,36000000,64000,
+local-loop.8080,,,209716200,209716200,
+tcp4 127.0.0.1:51000<->127.0.0.1:8080,lo0,Established,209716200,209716200,

@@ -20,8 +20,9 @@ public struct NettopSocketDelta: Sendable, Equatable {
         self.processName = processName
         self.protocolName = protocolName
         self.remoteEndpoint = remoteEndpoint
-        self.deltaBytesIn = max(0, deltaBytesIn)
-        self.deltaBytesOut = max(0, deltaBytesOut)
+        let allowSigned = (pid == NettopDeltaParser.unattributedPID || remoteEndpoint == NettopDeltaParser.unattributedEndpoint)
+        self.deltaBytesIn = allowSigned ? deltaBytesIn : max(0, deltaBytesIn)
+        self.deltaBytesOut = allowSigned ? deltaBytesOut : max(0, deltaBytesOut)
     }
 }
 
@@ -35,6 +36,10 @@ public struct NettopSnapshotResult: Sendable, Equatable {
     public var totalOutBps: Int64
     public var loopbackRxBytesPerSec: Int64
     public var loopbackTxBytesPerSec: Int64
+    public var unattributedInBytes: Int64
+    public var unattributedOutBytes: Int64
+    public var unattributedInBps: Int64
+    public var unattributedOutBps: Int64
 
     public init(
         perPIDBytesInDelta: [Int: Int64],
@@ -45,7 +50,11 @@ public struct NettopSnapshotResult: Sendable, Equatable {
         totalInBps: Int64,
         totalOutBps: Int64,
         loopbackRxBytesPerSec: Int64 = 0,
-        loopbackTxBytesPerSec: Int64 = 0
+        loopbackTxBytesPerSec: Int64 = 0,
+        unattributedInBytes: Int64 = 0,
+        unattributedOutBytes: Int64 = 0,
+        unattributedInBps: Int64 = 0,
+        unattributedOutBps: Int64 = 0
     ) {
         self.perPIDBytesInDelta = perPIDBytesInDelta
         self.perPIDBytesOutDelta = perPIDBytesOutDelta
@@ -56,10 +65,18 @@ public struct NettopSnapshotResult: Sendable, Equatable {
         self.totalOutBps = max(0, totalOutBps)
         self.loopbackRxBytesPerSec = max(0, loopbackRxBytesPerSec)
         self.loopbackTxBytesPerSec = max(0, loopbackTxBytesPerSec)
+        self.unattributedInBytes = unattributedInBytes
+        self.unattributedOutBytes = unattributedOutBytes
+        self.unattributedInBps = unattributedInBps
+        self.unattributedOutBps = unattributedOutBps
     }
 }
 
 public final class NettopDeltaParser: @unchecked Sendable {
+    public static let unattributedPID: Int = -1
+    public static let unattributedProcessToken = "Unattributed"
+    public static let unattributedEndpoint = "(physical-nic-unattributed)"
+
     private struct RetainedCounter: Equatable {
         var bytesIn: Int64
         var bytesOut: Int64
@@ -76,18 +93,25 @@ public final class NettopDeltaParser: @unchecked Sendable {
     }
 
     public let maxAbsentTicks: Int
+    private let nicCounterProvider: @Sendable () -> PhysicalNICCounterSnapshot
     private var prevSocketCounters: [String: RetainedCounter] = [:]
+    private var prevNICCounters: PhysicalNICCounterSnapshot?
     private var hasEstablishedBaseline = false
     private var tickSequence: Int = 0
     private var lastSampleTime: TimeInterval?
     private let lock = NSLock()
 
     public convenience init() {
-        self.init(maxAbsentTicks: 60)
+        self.init(maxAbsentTicks: 60, nicCounterProvider: { PhysicalNICCounterReader.readLiveCounters() })
     }
 
-    public init(maxAbsentTicks: Int) {
+    public convenience init(maxAbsentTicks: Int) {
+        self.init(maxAbsentTicks: maxAbsentTicks, nicCounterProvider: { PhysicalNICCounterReader.readLiveCounters() })
+    }
+
+    public init(maxAbsentTicks: Int, nicCounterProvider: @escaping @Sendable () -> PhysicalNICCounterSnapshot) {
         self.maxAbsentTicks = max(0, maxAbsentTicks)
+        self.nicCounterProvider = nicCounterProvider
     }
 
     public var trackedSocketCount: Int {
@@ -110,7 +134,8 @@ public final class NettopDeltaParser: @unchecked Sendable {
             guard let text = String(data: data, encoding: .utf8) else {
                 return NettopSnapshotResult(perPIDBytesInDelta: [:], perPIDBytesOutDelta: [:], externalSocketDeltas: [], totalInBps: 0, totalOutBps: 0)
             }
-            return ingestCSV(text, now: now)
+            let nicSnap = nicCounterProvider()
+            return ingestCSV(text, now: now, nicCounters: nicSnap)
         } catch {
             return NettopSnapshotResult(perPIDBytesInDelta: [:], perPIDBytesOutDelta: [:], externalSocketDeltas: [], totalInBps: 0, totalOutBps: 0)
         }
@@ -118,9 +143,13 @@ public final class NettopDeltaParser: @unchecked Sendable {
 
     /// Ingests `nettop -L 1 -n -J interface,state,bytes_in,bytes_out` per-socket CSV output,
     /// separating `lo0` / `127.0.0.0/8` / `::1` loopback traffic into dedicated loopback counters so loopback never inflates external rates.
-    /// Global baseline is only established once a snapshot contains at least 1 parsed data row; per-socket counters are retained across up to
-    /// `maxAbsentTicks` polls so transiently absent connections do not replay cumulative totals, and evicted beyond `maxAbsentTicks` so state stays bounded.
-    public func ingestCSV(_ csv: String, now: TimeInterval) -> NettopSnapshotResult {
+    /// When `nicCounters` is provided, calibrates total external inbound/outbound rates against active physical NIC byte counters
+    /// and records any positive gap above attributed per-process `nettop` sockets as `"Unattributed"` / `"未归属"` (never smearing other PIDs).
+    public func ingestCSV(
+        _ csv: String,
+        now: TimeInterval,
+        nicCounters: PhysicalNICCounterSnapshot? = nil
+    ) -> NettopSnapshotResult {
         lock.lock()
         defer { lock.unlock() }
 
@@ -280,10 +309,63 @@ public final class NettopDeltaParser: @unchecked Sendable {
             perPIDLoopOutBps[pid] = Int64(Double(dOut) / dt)
         }
 
-        let totalExtInBps = perPIDExtInBps.values.reduce(0, +)
-        let totalExtOutBps = perPIDExtOutBps.values.reduce(0, +)
         let totalLoopInBps = perPIDLoopInBps.values.reduce(0, +)
         let totalLoopOutBps = perPIDLoopOutBps.values.reduce(0, +)
+
+        var totalExtInBps = perPIDExtInBps.values.reduce(0, +)
+        var totalExtOutBps = perPIDExtOutBps.values.reduce(0, +)
+        var unattributedInBytes: Int64 = 0
+        var unattributedOutBytes: Int64 = 0
+        var unattributedInBps: Int64 = 0
+        var unattributedOutBps: Int64 = 0
+
+        if let curNIC = nicCounters {
+            if isFirstBaseline {
+                prevNICCounters = curNIC
+                totalExtInBps = 0
+                totalExtOutBps = 0
+            } else if let prevNIC = prevNICCounters {
+                let nicDeltaInBytes: Int64 = curNIC.externalBytesIn >= prevNIC.externalBytesIn
+                    ? Int64(min(UInt64(Int64.max), curNIC.externalBytesIn - prevNIC.externalBytesIn))
+                    : 0
+                let nicDeltaOutBytes: Int64 = curNIC.externalBytesOut >= prevNIC.externalBytesOut
+                    ? Int64(min(UInt64(Int64.max), curNIC.externalBytesOut - prevNIC.externalBytesOut))
+                    : 0
+                prevNICCounters = curNIC
+
+                let attributedInBytes = perPIDExtInBytes.values.reduce(0, +)
+                let attributedOutBytes = perPIDExtOutBytes.values.reduce(0, +)
+
+                unattributedInBytes = nicDeltaInBytes - attributedInBytes
+                unattributedOutBytes = nicDeltaOutBytes - attributedOutBytes
+                unattributedInBps = unattributedInBytes != 0 ? Int64(Double(unattributedInBytes) / dt) : 0
+                unattributedOutBps = unattributedOutBytes != 0 ? Int64(Double(unattributedOutBytes) / dt) : 0
+
+                if unattributedInBps != 0 {
+                    perPIDExtInBps[Self.unattributedPID] = unattributedInBps
+                }
+                if unattributedOutBps != 0 {
+                    perPIDExtOutBps[Self.unattributedPID] = unattributedOutBps
+                }
+                if unattributedInBytes != 0 || unattributedOutBytes != 0 {
+                    sockDeltas.append(
+                        NettopSocketDelta(
+                            pid: Self.unattributedPID,
+                            processName: Self.unattributedProcessToken,
+                            protocolName: "nic",
+                            remoteEndpoint: Self.unattributedEndpoint,
+                            deltaBytesIn: unattributedInBytes,
+                            deltaBytesOut: unattributedOutBytes
+                        )
+                    )
+                }
+
+                totalExtInBps = Int64(Double(nicDeltaInBytes) / dt)
+                totalExtOutBps = Int64(Double(nicDeltaOutBytes) / dt)
+            } else {
+                prevNICCounters = curNIC
+            }
+        }
 
         return NettopSnapshotResult(
             perPIDBytesInDelta: perPIDExtInBps,
@@ -294,7 +376,11 @@ public final class NettopDeltaParser: @unchecked Sendable {
             totalInBps: totalExtInBps,
             totalOutBps: totalExtOutBps,
             loopbackRxBytesPerSec: totalLoopInBps,
-            loopbackTxBytesPerSec: totalLoopOutBps
+            loopbackTxBytesPerSec: totalLoopOutBps,
+            unattributedInBytes: unattributedInBytes,
+            unattributedOutBytes: unattributedOutBytes,
+            unattributedInBps: unattributedInBps,
+            unattributedOutBps: unattributedOutBps
         )
     }
 
